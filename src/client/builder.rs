@@ -21,6 +21,7 @@ use crate::sync_task::MajorSyncTask;
 use crate::transport::TransportFactory;
 use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
+use crate::types::history_sync_admission::HistorySyncAdmission;
 use wacore::handshake::NoiseCertPolicy;
 use wacore::runtime::Runtime;
 
@@ -115,6 +116,7 @@ pub struct ClientBuilder {
     cache_config: CacheConfig,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
+    history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     skip_history_sync: bool,
     ab_props_fetch: bool,
     presence_policy: PresencePolicy,
@@ -150,6 +152,7 @@ impl ClientBuilder {
             cache_config: CacheConfig::default(),
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
+            history_sync_admission: None,
             skip_history_sync: false,
             ab_props_fetch: true,
             presence_policy: PresencePolicy::default(),
@@ -272,6 +275,25 @@ impl ClientBuilder {
         hook: Arc<dyn InboundDurabilityHook>,
     ) -> Self {
         self.inbound_durability_hook = Some(hook);
+        self
+    }
+
+    /// Register a synchronous policy that can reject inbound history-sync
+    /// notifications before they create history-sync work.
+    pub fn with_history_sync_admission<A>(mut self, admission: A) -> Self
+    where
+        A: HistorySyncAdmission + 'static,
+    {
+        self.history_sync_admission = Some(Arc::new(admission));
+        self
+    }
+
+    /// Register an already-shared history-sync admission policy.
+    pub fn with_history_sync_admission_arc(
+        mut self,
+        admission: Arc<dyn HistorySyncAdmission>,
+    ) -> Self {
+        self.history_sync_admission = Some(admission);
         self
     }
 
@@ -555,6 +577,7 @@ impl ClientBuilder {
                 #[cfg(feature = "plugins")]
                 plugin_host,
                 noise_cert_policy: self.noise_cert_policy,
+                history_sync_admission: self.history_sync_admission,
             },
         );
         let client = assembly.client();
@@ -706,6 +729,7 @@ pub(super) struct ClientExtensions {
     #[cfg(feature = "plugins")]
     pub(super) plugin_host: Option<Arc<PluginHost>>,
     pub(super) noise_cert_policy: NoiseCertPolicy,
+    pub(super) history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
 }
 
 impl ClientAssembly {
@@ -881,6 +905,17 @@ mod tests {
         spawns: Arc<AtomicUsize>,
     }
 
+    struct CountingHistorySyncAdmission {
+        decisions: Arc<AtomicUsize>,
+    }
+
+    impl HistorySyncAdmission for CountingHistorySyncAdmission {
+        fn decide(&self, _metadata: &crate::HistorySyncMetadata<'_>) -> crate::HistorySyncDecision {
+            self.decisions.fetch_add(1, Ordering::SeqCst);
+            crate::HistorySyncDecision::Accept
+        }
+    }
+
     #[async_trait::async_trait]
     impl Runtime for CountingRuntime {
         fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
@@ -1035,6 +1070,38 @@ mod tests {
             NoiseCertPolicy::DangerSkipCertChainVerify
         );
         bypass.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn history_sync_admission_reaches_the_built_client() {
+        let decisions = Arc::new(AtomicUsize::new(0));
+        let client = complete_builder()
+            .await
+            .with_history_sync_admission(CountingHistorySyncAdmission {
+                decisions: Arc::clone(&decisions),
+            })
+            .build()
+            .await
+            .expect("build")
+            .into_parts()
+            .0;
+
+        let admission = client
+            .history_sync_admission
+            .as_ref()
+            .expect("builder-installed history-sync admission");
+        assert_eq!(
+            admission.decide(&crate::HistorySyncMetadata {
+                sync_type: None,
+                chunk_order: None,
+                progress: None,
+                file_length: None,
+                inline_payload_len: None,
+                peer_data_request_session_id: None,
+            }),
+            crate::HistorySyncDecision::Accept
+        );
+        assert_eq!(decisions.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
