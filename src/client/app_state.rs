@@ -953,7 +953,38 @@ impl Client {
     /// again. The consumer's handlers see the replay with `from_full_sync: true`
     /// and must be idempotent/order-guarded (ZapFast's mute/pin/lock handlers
     /// are). Whatsmeow's "remove app state" resync is the same maneuver.
+    ///
+    /// The reservation is taken *before* the version reset and held through the
+    /// replay: resetting under a concurrent sync of the same collection would
+    /// let that sync's checkpoint restore an advanced version (or half of one)
+    /// before this replay reads it, silently turning the from-zero replay into
+    /// an incremental one.
     pub async fn resync_app_state_collection(self: &Arc<Self>, name: WAPatchName) {
+        // Wait for any holder: an in-flight sync or patch send is not doing
+        // this request's work (it pages from the version we are about to drop),
+        // so skipping would discharge the caller's one shot at a replay.
+        let _guard = match self
+            .reserve_for_sync(name, ReservationWait::Always, self.sync_scope(None))
+            .await
+        {
+            Ok(guard) => guard,
+            Err(ReservationSkip::EquivalentSyncInFlight) => {
+                // Unreachable with `Always` (it never skips behind a sync);
+                // kept exhaustive so a future wait mode reads correctly here.
+                warn!(
+                    target: "Client/AppState",
+                    "Could not reserve {name:?} for a from-zero replay; an equivalent sync holds it"
+                );
+                return;
+            }
+            Err(ReservationSkip::WaitTimedOut) => {
+                warn!(
+                    target: "Client/AppState",
+                    "Gave up waiting to reserve {name:?} for a from-zero replay"
+                );
+                return;
+            }
+        };
         let backend = self.persistence_manager.backend();
         if let Err(error) = backend
             .set_version(name.as_str(), wacore::appstate::hash::HashState::default())
@@ -965,11 +996,18 @@ impl Client {
             );
             return;
         }
-        self.process_sync_task(MajorSyncTask::AppStateSync {
-            name,
-            full_sync: true,
-        })
-        .await;
+        // A deferred or failed replay is not retried here: the caller asked
+        // once, and rescheduling a plain `full_sync` task would replay from
+        // whatever version survived — not the from-zero replay it asked for.
+        // Callers that must have the replay retry `resync_app_state_collection`.
+        match self.process_app_state_sync_task(name, true).await {
+            Ok(SyncOutcome::Completed) => {}
+            Ok(SyncOutcome::Deferred) => warn!(
+                target: "Client/AppState",
+                "From-zero replay of {name:?} deferred mid-way; not retried"
+            ),
+            Err(error) => self.log_sync_error(&format!("from-zero replay of {name:?}"), &error),
+        }
     }
 
     /// Public entry point for processing [`MajorSyncTask`] from the sync channel.

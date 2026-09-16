@@ -2591,6 +2591,8 @@ mod tests {
         assert_eq!(EventKind::AppStateSyncFailed as u8, 60);
         assert_eq!(EventKind::EncDecryptFailed as u8, 67);
         assert_eq!(EventKind::CallLogSync as u8, 68);
+        assert_eq!(EventKind::ClientExpirationChanged as u8, 69);
+        assert_eq!(EventKind::LockChatUpdate as u8, 70);
     }
 
     /// Every rejection a consumer can be handed must survive being persisted
