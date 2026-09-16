@@ -289,6 +289,7 @@ pub enum EventKind {
     EncDecryptFailed,
     CallLogSync,
     ClientExpirationChanged,
+    LockChatUpdate,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -302,7 +303,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::ClientExpirationChanged as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::LockChatUpdate as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -1083,6 +1084,13 @@ pub enum Event {
 
     /// The server pushed (or withdrew) a retirement deadline for this build.
     ClientExpirationChanged(ClientExpirationChanged),
+
+    /// A chat was locked or unlocked on a linked device (`lock` syncd
+    /// mutation, `LockChatAction.locked`).
+    ///
+    /// Last, like every new variant: a binary `Serialize` format writes the
+    /// variant index, so inserting in the middle renumbers everything after it.
+    LockChatUpdate(LockChatUpdate),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1178,6 +1186,7 @@ impl Event {
             Event::EncDecryptFailed(_) => EventKind::EncDecryptFailed,
             Event::CallLogSync(_) => EventKind::CallLogSync,
             Event::ClientExpirationChanged(_) => EventKind::ClientExpirationChanged,
+            Event::LockChatUpdate(_) => EventKind::LockChatUpdate,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -2322,6 +2331,17 @@ pub struct MuteUpdate {
     pub jid: Jid,
     pub timestamp: DateTime<Utc>,
     pub action: Box<wa::sync_action_value::MuteAction>,
+    pub from_full_sync: bool,
+}
+
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct LockChatUpdate {
+    /// The chat being locked or unlocked (chat lock, the hidden
+    /// "locked chats" folder on the primary device).
+    pub jid: Jid,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::LockChatAction>,
     pub from_full_sync: bool,
 }
 
