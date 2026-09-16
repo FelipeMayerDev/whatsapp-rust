@@ -947,6 +947,31 @@ impl Client {
             .detach();
     }
 
+    /// Replays a collection from the very beginning: drops the stored version
+    /// (keeping sync keys and mutation MACs in the store) and re-runs the full
+    /// sync, so every mutation the server still holds is decoded and dispatched
+    /// again. The consumer's handlers see the replay with `from_full_sync: true`
+    /// and must be idempotent/order-guarded (ZapFast's mute/pin/lock handlers
+    /// are). Whatsmeow's "remove app state" resync is the same maneuver.
+    pub async fn resync_app_state_collection(self: &Arc<Self>, name: WAPatchName) {
+        let backend = self.persistence_manager.backend();
+        if let Err(error) = backend
+            .set_version(name.as_str(), wacore::appstate::hash::HashState::default())
+            .await
+        {
+            warn!(
+                target: "Client/AppState",
+                "Could not reset stored version for {name:?}: {error}"
+            );
+            return;
+        }
+        self.process_sync_task(MajorSyncTask::AppStateSync {
+            name,
+            full_sync: true,
+        })
+        .await;
+    }
+
     /// Public entry point for processing [`MajorSyncTask`] from the sync channel.
     #[cfg_attr(
         feature = "tracing",
