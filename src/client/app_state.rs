@@ -832,7 +832,7 @@ impl Client {
     async fn pre_download_external_blobs(
         &self,
         patch_lists: &[wacore::appstate::patch_decode::PatchList],
-    ) -> HashMap<String, Vec<u8>> {
+    ) -> HashMap<String, bytes::Bytes> {
         use futures::StreamExt;
 
         // Kept only so a failed download logs the right message (snapshot vs patch).
@@ -892,7 +892,9 @@ impl Client {
                         debug!(target: "Client/AppState", "Downloaded external snapshot ({} bytes)", bytes.len());
                     }
                     if let Some(path) = path {
-                        pre_downloaded.insert(path, bytes);
+                        // `Bytes::from(Vec)` moves; the resolvers below then
+                        // hand out refcounts instead of copying the blob.
+                        pre_downloaded.insert(path, bytes::Bytes::from(bytes));
                     }
                 }
                 Err(e) => match kind {
@@ -1386,7 +1388,15 @@ impl Client {
     /// snapshot silently never happens.
     fn schedule_app_state_task_retry(self: &Arc<Self>, name: WAPatchName, full_sync: bool) {
         let mut scope = self.sync_scope(None);
-        let client = self.clone();
+        // Weak across the sleep: the backoff doubles to an hour, and holding a
+        // strong reference through it keeps the entire client graph — caches,
+        // stores, subsystems — alive for that long after the application has
+        // dropped its handle, and defers the `Drop` that signals shutdown. The
+        // runtime handle is kept separately so the sleep needs nothing from the
+        // client, and the loop re-acquires a strong reference for the round it
+        // is about to run and releases it again at the end of the iteration.
+        let weak_client = Arc::downgrade(self);
+        let runtime = self.runtime.clone();
         self.runtime.spawn_detached(Box::pin(async move {
             // Attempts and rounds are counted separately: a wait that ran out
             // never reached the server, so spending an attempt on it would let a
@@ -1397,7 +1407,11 @@ impl Client {
                 if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
                     break;
                 }
-                client.runtime.sleep(app_state_retry_backoff(attempts)).await;
+                runtime.sleep(app_state_retry_backoff(attempts)).await;
+                let Some(client) = weak_client.upgrade() else {
+                    debug!(target: "Client/AppState", "App state task retry cancelled: client is gone");
+                    return;
+                };
                 if client.is_terminal() {
                     debug!(target: "Client/AppState", "App state task retry cancelled: client is finished");
                     return;
@@ -1503,7 +1517,11 @@ impl Client {
         if collections.is_empty() {
             return;
         }
-        let client = self.clone();
+        // Weak across the sleep, for the same reason as
+        // `schedule_app_state_task_retry`: an hour-long backoff must not keep
+        // the client graph alive after the application lets go of it.
+        let weak_client = Arc::downgrade(self);
+        let runtime = self.runtime.clone();
         self.runtime.spawn_detached(Box::pin(async move {
             let mut scope = scope;
             let mut settles = settles;
@@ -1525,7 +1543,11 @@ impl Client {
                 if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
                     break;
                 }
-                client.runtime.sleep(app_state_retry_backoff(attempts)).await;
+                runtime.sleep(app_state_retry_backoff(attempts)).await;
+                let Some(client) = weak_client.upgrade() else {
+                    debug!(target: "Client/AppState", "App state retry cancelled: client is gone");
+                    return;
+                };
                 // Waited for, not charged for. Without this the loop spends an
                 // attempt on every offline round, and the whole budget is gone
                 // long before a reconnect that backs off in minutes returns —
@@ -1615,6 +1637,12 @@ impl Client {
             // producing any — would otherwise finish in silence, with the
             // collections still stale. `retryable` is exactly what these are:
             // not synced, and a later trigger can still fix them.
+            //
+            // Nobody to report to if the client is gone; the strong reference
+            // the rounds held was released with the last of them.
+            let Some(client) = weak_client.upgrade() else {
+                return;
+            };
             if client.admits(scope).is_ok() {
                 let exhausted = BatchedSyncOutcome {
                     retryable: pending,
@@ -2135,7 +2163,7 @@ impl Client {
             // concurrently (independent CDN GETs, keyed by directPath).
             let pre_downloaded = self.pre_download_external_blobs(&patch_lists).await;
 
-            let download = |ext: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
+            let download = |ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
                 if let Some(path) = &ext.direct_path {
                     if let Some(bytes) = pre_downloaded.get(path) {
                         Ok(bytes.clone())
@@ -2333,8 +2361,8 @@ impl Client {
                 // the set, which is what keeps it from reading as a full sync.
                 let full_sync = replaying_snapshot.contains(&name);
                 wacore::telemetry::appstate_mutations(mutations.len() as u64);
-                for m in mutations {
-                    self.dispatch_app_state_mutation(&m, full_sync).await;
+                for mut m in mutations {
+                    self.dispatch_app_state_mutation(&mut m, full_sync).await;
                 }
 
                 // No version write here. `process_one_patch_list` already
@@ -2522,7 +2550,7 @@ impl Client {
                 .pre_download_external_blobs(std::slice::from_ref(&pl))
                 .await;
 
-            let download = |ext: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
+            let download = |ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
                 if let Some(path) = &ext.direct_path {
                     if let Some(bytes) = pre_downloaded.get(path) {
                         Ok(bytes.clone())
@@ -2587,9 +2615,9 @@ impl Client {
                 .await;
 
             wacore::telemetry::appstate_mutations(mutations.len() as u64);
-            for m in mutations {
+            for mut m in mutations {
                 debug!(target: "Client/AppState", "Dispatching mutation kind={} index_len={} full_sync={}", m.index.first().map(|s| s.as_str()).unwrap_or(""), m.index.len(), full_sync);
-                self.dispatch_app_state_mutation(&m, full_sync).await;
+                self.dispatch_app_state_mutation(&mut m, full_sync).await;
             }
 
             // A collection the server refused advances nothing: the processor
@@ -3152,7 +3180,7 @@ impl Client {
             let pre_downloaded = self
                 .pre_download_external_blobs(std::slice::from_ref(&list))
                 .await;
-            let download = |ext: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
+            let download = |ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
                 let path = ext
                     .direct_path
                     .as_ref()
@@ -3171,8 +3199,8 @@ impl Client {
                 // clean apply.
                 Ok((mutations, _, list)) => {
                     wacore::telemetry::appstate_mutations(mutations.len() as u64);
-                    for m in &mutations {
-                        self.dispatch_app_state_mutation(m, false).await;
+                    for mut m in mutations {
+                        self.dispatch_app_state_mutation(&mut m, false).await;
                     }
                     if let Some(refused) = &list.error {
                         debug!(
@@ -3443,8 +3471,8 @@ impl Client {
                 // would lose a mute or an archive for good. And what they
                 // describe is the account, not the session that learned it,
                 // which is why the ordinary sync path dispatches the same way.
-                for m in &mutations {
-                    self.dispatch_app_state_mutation(m, true).await;
+                for mut m in mutations {
+                    self.dispatch_app_state_mutation(&mut m, true).await;
                 }
             }
             Ok(wacore::appstate_sync::RecoveryOutcome::Retired) => {
@@ -3558,9 +3586,12 @@ impl Client {
         }
     }
 
+    /// `&mut` so a dispatcher can move the action out of the mutation into
+    /// its event instead of deep-cloning it: a full sync dispatches every
+    /// mutation of every collection through here.
     pub(crate) async fn dispatch_app_state_mutation(
         &self,
-        m: &crate::appstate_sync::Mutation,
+        m: &mut crate::appstate_sync::Mutation,
         full_sync: bool,
     ) {
         use wacore::types::events::Event;
@@ -3669,9 +3700,14 @@ impl Client {
 
                 // WhatsApp Web sends presence immediately when receiving pushname
                 if old.is_empty() && !new_name.is_empty() {
-                    debug!(target: "Client/AppState", "Sending presence after receiving initial pushname from app state sync");
-                    if let Err(e) = self.presence().set_available().await {
-                        warn!(target: "Client/AppState", "Failed to send presence after pushname sync: {e:?}");
+                    match self.send_automatic_available().await {
+                        Ok(true) => {
+                            debug!(target: "Client/AppState", "Sent presence after receiving initial pushname from app state sync");
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(target: "Client/AppState", "Failed to send presence after pushname sync: {e:?}");
+                        }
                     }
                 }
             } else {
@@ -3695,6 +3731,48 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Neither retry scheduler may keep the client alive while it sleeps.
+    ///
+    /// The backoff doubles to an hour, so a strong reference held across it
+    /// pins the whole graph — caches, stores, the persistence manager — and
+    /// defers the `Drop` that signals shutdown, for as long after the
+    /// application let go of the client. Both loops re-acquire a strong
+    /// reference for the round they are about to run and release it again.
+    #[tokio::test]
+    async fn a_sleeping_app_state_retry_does_not_hold_the_client() {
+        let client = crate::test_utils::create_test_client_with_name("appstate_retry_weak").await;
+        let scope = client.sync_scope(None);
+        // Let construction settle before the count is taken: a startup task
+        // still holding its own clone would otherwise release it during the
+        // yields below and read as this scheduler letting one go.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let before = Arc::strong_count(&client);
+
+        client.schedule_app_state_task_retry(WAPatchName::RegularLow, false);
+        client.schedule_app_state_retry(
+            vec![WAPatchName::RegularHigh],
+            scope,
+            SyncSettles::JustTheCollections,
+            false,
+        );
+
+        // Time is not advanced here on purpose: both tasks park in their first
+        // backoff sleep, which is exactly the state being asserted about. Polled
+        // rather than counted in yields, because under a loaded test host the
+        // spawned tasks may not have reached their sleep after any fixed number
+        // of yields; a task that held the client across its backoff would keep
+        // the count above `before` for the whole (minutes-long) sleep, which the
+        // poll's deadline turns into a failure. `<=` tolerates a startup task
+        // releasing its own clone in the meantime.
+        crate::test_utils::poll_until(
+            "both retry schedulers to park in their backoff holding the client weakly",
+            || Arc::strong_count(&client) <= before,
+        )
+        .await;
+    }
 
     #[tokio::test]
     async fn collection_replay_reports_unknown_collection() {

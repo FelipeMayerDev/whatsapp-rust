@@ -14,21 +14,85 @@
 #[allow(clippy::disallowed_types)]
 pub(crate) mod test_alloc {
     use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
     pub(crate) static ALLOCS: AtomicU64 = AtomicU64::new(0);
+    /// Bytes currently live, as a wrapping signed counter: allocation adds, free
+    /// subtracts, so a *delta* over a window is what that window still holds even
+    /// though the absolute value is meaningless (the process was already running
+    /// when counting started). Wrapping arithmetic keeps a window that frees more
+    /// than it allocates from being a panic in debug.
+    pub(crate) static LIVE_BYTES: AtomicI64 = AtomicI64::new(0);
+
+    /// Size of the largest single block requested since it was last reset.
+    /// Separate from `ALLOCS` because the two answer different questions: a
+    /// count catches work that should not happen at all, this catches one
+    /// allocation that should not be *that big* — a boxed future sized for
+    /// every arm of a dispatch, say, which costs one allocation either way.
+    pub(crate) static MAX_BLOCK: AtomicUsize = AtomicUsize::new(0);
 
     struct CountingAlloc;
 
     unsafe impl GlobalAlloc for CountingAlloc {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
+            LIVE_BYTES.fetch_add(layout.size() as i64, Ordering::Relaxed);
+            MAX_BLOCK.fetch_max(layout.size(), Ordering::Relaxed);
             unsafe { System.alloc(layout) }
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            LIVE_BYTES.fetch_sub(layout.size() as i64, Ordering::Relaxed);
             unsafe { System.dealloc(ptr, layout) }
         }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            LIVE_BYTES.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
+            MAX_BLOCK.fetch_max(new_size, Ordering::Relaxed);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    /// The quietest (live bytes, allocations) delta observed while running `op`,
+    /// retrying until one sample is within `expected` on both counts.
+    ///
+    /// Same contract and the same reason as [`min_allocs`]: both counters are
+    /// process-wide, so a sibling test thread allocating inside the window
+    /// inflates that window. Retrying until the window lands quiet makes ambient
+    /// traffic cost iterations instead of a false failure, and a real regression
+    /// never reaches `expected`, so the caller's assertion still fires with what
+    /// was actually observed.
+    pub(crate) fn min_live<T>(expected: (i64, u64), mut op: impl FnMut() -> T) -> (i64, u64) {
+        const BUDGET: u32 = 10_000;
+
+        let mut best = (i64::MAX, u64::MAX);
+        for _ in 0..BUDGET {
+            let (bytes_before, allocs_before) = (
+                LIVE_BYTES.load(Ordering::Relaxed),
+                ALLOCS.load(Ordering::Relaxed),
+            );
+            let held = std::hint::black_box(op());
+            let (bytes, allocs) = (
+                LIVE_BYTES
+                    .load(Ordering::Relaxed)
+                    .wrapping_sub(bytes_before),
+                ALLOCS.load(Ordering::Relaxed) - allocs_before,
+            );
+            // Dropped outside the window: what it frees is not this window's.
+            drop(held);
+            let sample = (bytes, allocs);
+            if sample.0 <= expected.0 && sample.1 <= expected.1 {
+                return sample;
+            }
+            // Always one real window, never minima stitched from two: ambient
+            // traffic inflates both counters together, so the sample with the
+            // fewest allocations is the quietest one this window saw.
+            if (sample.1, sample.0) < (best.1, best.0) {
+                best = sample;
+            }
+        }
+        best
     }
 
     #[global_allocator]
@@ -57,6 +121,31 @@ pub(crate) mod test_alloc {
             let after = ALLOCS.load(Ordering::Relaxed);
             drop(value);
             min = min.min(after - before);
+            if min <= expected {
+                break;
+            }
+        }
+        min
+    }
+
+    /// Smallest "largest single block" observed while running `op`, retrying
+    /// until it reaches `expected`.
+    ///
+    /// Same discipline and the same reason as [`min_allocs`]: `MAX_BLOCK` is
+    /// process-wide, so a sibling test thread's large allocation lands in this
+    /// window's maximum. Taking the minimum across windows makes that cost
+    /// iterations rather than a false failure, while a block the measured code
+    /// really does allocate is in *every* window and survives the minimum.
+    pub(crate) fn min_max_block<T>(expected: usize, mut op: impl FnMut() -> T) -> usize {
+        const BUDGET: u32 = 10_000;
+
+        let mut min = usize::MAX;
+        for _ in 0..BUDGET {
+            MAX_BLOCK.store(0, Ordering::Relaxed);
+            let value = std::hint::black_box(op());
+            let observed = MAX_BLOCK.load(Ordering::Relaxed);
+            drop(value);
+            min = min.min(observed);
             if min <= expected {
                 break;
             }
@@ -141,8 +230,14 @@ pub use client::{
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
-pub use client::{ConnectError, ConnectStage, Reachability, SignalMaintenanceError};
+pub use client::{
+    ConnectError, ConnectStage, ProtocolTerminalReason, Reachability, RunCompletionReason,
+    SignalMaintenanceError,
+};
 pub use types::durability_hook::InboundDurabilityHook;
+pub use types::history_sync_admission::{
+    HistorySyncAdmission, HistorySyncDecision, HistorySyncMetadata,
+};
 pub use types::retry_admission::RetryAdmission;
 pub mod download;
 pub mod error;
@@ -227,25 +322,27 @@ pub use features::{
     EventCreationParams, EventResponseType, Events, GroupAppealStatus, GroupCreateOptions,
     GroupDescription, GroupEphemeralSettings, GroupError, GroupJoinError, GroupMessageReporter,
     GroupMetadata, GroupParticipant, GroupParticipantDetails, GroupParticipantOptions,
-    GroupProfilePicture, GroupSubject, GroupType, Groups, GrowthLockInfo, ImporterAddress,
-    InviteInfoError, IsOnWhatsAppResult, JoinGroupResult, Labels, LinkSubgroupsResult,
-    MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest, MemberAddMode,
-    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
-    MessageEditError, MessageRetransmission, Mex, MexError, MexErrorExtensions, MexGraphQLError,
-    MexRequest, MexResponse, NackReason, NewChatMessageCapping, Newsletter, NewsletterAdminInfo,
-    NewsletterAdminProfile, NewsletterError, NewsletterFollower, NewsletterMessage,
-    NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount, NewsletterRole,
-    NewsletterState, NewsletterVerification, Order, OrderPriceDetails, OrderProduct,
+    GroupPictureEntry, GroupProfilePicture, GroupProfilePictureOutcome, GroupSubject, GroupType,
+    Groups, GrowthLockInfo, ImporterAddress, InviteInfoError, IsOnWhatsAppResult, JoinGroupResult,
+    Labels, LinkSubgroupsResult, MediaRetryResult, MediaReupload, MediaReuploadError,
+    MediaReuploadRequest, MemberAddMode, MemberLinkMode, MemberShareHistoryMode,
+    MembershipApprovalMode, MembershipRequest, MessageEditError, MessageRetransmission, Mex,
+    MexError, MexErrorExtensions, MexFatalError, MexGraphQLError, MexRequest, MexResponse,
+    NackReason, NewChatMessageCapping, Newsletter, NewsletterAdminInfo, NewsletterAdminProfile,
+    NewsletterError, NewsletterFollower, NewsletterMessage, NewsletterMessageType,
+    NewsletterMetadata, NewsletterReactionCount, NewsletterRole, NewsletterState,
+    NewsletterVerification, Order, OrderPriceDetails, OrderProduct, OwnUsername,
     ParticipantChangeResponse, ParticipantType, PictureType, PollError, PollOptionResult,
-    PollVoteCiphertext, Polls, Presence, PresenceError, PresenceStatus, PreviousDescription, Price,
-    Product, ProductAvailability, ProductImage, ProductVideo, Profile, ProfileError,
-    ProfilePicture, QuickReplies, ReachoutTimelock, ReportedGroupMessage, ReportedGroupMessages,
-    RetryReason, RetryRequestError, RetryRequestOptions, RetryRequestOutcome, SalePrice,
-    SecretEncKind, SecretEncrypted, SetProfilePictureResponse, Signal, SignalError,
-    SignalSessionInfo, SignalSessionMigration, StanzaRejection, StanzaResponseError, Status,
-    StatusPrivacySetting, StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError,
-    UnlinkSubgroupsResult, UserInfo, UsyncSubprotocolError, VariantProperty, VerifiedName,
-    group_type, message_key, message_range,
+    PollVoteCiphertext, Polls, Presence, PresenceError, PresencePolicy, PresenceStatus,
+    PreviousDescription, Price, Product, ProductAvailability, ProductImage, ProductVideo, Profile,
+    ProfileError, ProfilePicture, ProfilePictureLookup, ProfilePictureLookupOptions, QuickReplies,
+    ReachoutTimelock, ReportedGroupMessage, ReportedGroupMessages, RetryReason, RetryRequestError,
+    RetryRequestOptions, RetryRequestOutcome, SalePrice, SecretEncKind, SecretEncrypted,
+    SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo, SignalSessionMigration,
+    StanzaRejection, StanzaResponseError, Status, StatusPrivacySetting, StatusSendOptions,
+    SyncActionMessageRange, TcToken, TcTokenError, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH,
+    UnlinkSubgroupsResult, UserInfo, UsernameLookup, UsernameLookupError, UsernameLookupUser,
+    UsyncSubprotocolError, VariantProperty, VerifiedName, group_type, message_key, message_range,
 };
 
 pub mod bot;
@@ -269,7 +366,9 @@ pub mod prelude {
     #[cfg(feature = "client-lifecycle")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     pub use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
-    pub use crate::client::{ConnectError, ConnectStage};
+    pub use crate::client::{
+        ConnectError, ConnectStage, ProtocolTerminalReason, RunCompletionReason,
+    };
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     pub use crate::plugins::{
@@ -287,10 +386,10 @@ pub mod prelude {
     #[cfg(feature = "signal")]
     pub use crate::shutdown::shutdown_signal;
     #[cfg(feature = "sqlite-storage")]
-    pub use crate::store::SqliteStore;
+    pub use crate::store::{SqliteStore, StoredDeviceSummary};
     pub use crate::types::events::{
-        BatchOrigin, ChannelEventHandler, Event, EventHandler, EventInterest, EventKind,
-        InboundMessage, MessageBatch, Subscription,
+        BatchOrigin, ChannelEventHandler, ChannelEventStats, Event, EventHandler, EventInterest,
+        EventKind, InboundMessage, MessageBatch, Subscription,
     };
     pub use crate::types::message::MessageInfo;
     pub use crate::{Jid, Server};
@@ -312,6 +411,10 @@ pub mod bench_support;
 
 #[cfg(test)]
 pub mod test_utils;
+
+#[cfg(all(not(target_arch = "wasm32"), any(test, feature = "test-support")))]
+#[doc(hidden)]
+pub mod test_support;
 
 #[cfg(test)]
 mod reexports_test;

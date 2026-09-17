@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use log::warn;
+use portable_atomic::{AtomicU64, Ordering as PortableOrdering};
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
 use wacore::stanza::call::{
@@ -36,8 +37,8 @@ use wacore::voip::transport::RelayTransportFactory;
 use wacore::voip::{
     AudioCodec, AudioConfig, AudioFormat, AudioRtpProfile, CallChannels, CallConfig, CallDirection,
     CallEngine, CallEvent, CallPhase, CodecDecisionSource, EncodedAudioFrame, GroupEngineConfig,
-    VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame, VideoUpgradeToken,
-    run_call, video_control_channel,
+    KeyframeUrgency, VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame,
+    VideoInput, VideoUpgradeToken, run_call, video_control_channel,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
@@ -48,7 +49,7 @@ use crate::voip::audio::{
     AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource, WA_FRAME_SAMPLES,
 };
 use crate::voip::driver::RandTxIds;
-use crate::voip::video::{VideoSink, VideoSource};
+use crate::voip::video::{TimedVideoFrame, VideoSink, VideoSource};
 
 enum AudioEndpoints {
     Pcm {
@@ -3180,17 +3181,35 @@ async fn attach_engine(
 
     // Video plumbing: the drive loop always gets the channels; the endpoints attach now (a
     // `.video()` call) or later (an upgrade via CallHandle::start_video/accept_video).
-    let (video_in_rx, video_ctl_rx) = video_shared.take_receivers();
+    let (video_in_rx, timed_video_in_rx, video_ctl_rx) = video_shared.take_receivers();
     let (video_out_tx, video_out_rx) = async_channel::bounded::<VideoFrame>(VIDEO_OUT_CHANNEL_CAP);
     // Forwarder from the drive loop to whatever sink is CURRENTLY attached (swappable mid-call).
     // Ends when the drive loop drops its video_out sender; moved into the media task like mic_feed.
     let sink_slot = video_shared.sink_slot.clone();
+    // The drive loop watches its own `video_out` for the same purpose, but that queue is drained by
+    // THIS task and so is rarely the one that fills. A sink the consumer attached is where a frame
+    // actually goes missing, and it is the last boundary that still knows a picture was lost -- past
+    // here the consumer's channel is opaque to us.
+    let keyframe_recovery = video_shared.ctl_tx.clone();
+    // Authoritative call generation, stamped here so a same-call-id replacement's frames never
+    // masquerade as this call's: the engine leaves `generation` at zero and only this boundary
+    // knows the registry generation. Never replaced by per-source or arrival metadata.
+    let media_generation = generation;
     let video_out_feed = client.runtime.spawn(Box::pin(async move {
-        while let Ok(frame) = video_out_rx.recv().await {
+        while let Ok(mut frame) = video_out_rx.recv().await {
+            frame.generation = media_generation;
             let tx = sink_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            if let Some(tx) = tx {
-                // Loss tolerant, like the speaker: a stalled sink sheds frames.
-                let _ = tx.try_send(frame);
+            // Loss tolerant, like the speaker: a stalled sink sheds frames.
+            // Only `Full` is a shed worth recovering from -- a closed sink is
+            // a consumer that has gone away, and asking it for a keyframe an
+            // interval until the call ends buys the peer nothing but its
+            // largest frame.
+            if let Some(tx) = tx
+                && let Err(async_channel::TrySendError::Full(_)) = tx.try_send(frame)
+            {
+                keyframe_recovery.send(VideoControl::RequestPeerKeyframe(
+                    KeyframeUrgency::Coalesced,
+                ));
             }
         }
     }));
@@ -3217,6 +3236,7 @@ async fn attach_engine(
         events: ev_tx,
         rekey: rekey_rx,
         video_in: video_in_rx,
+        timed_video_in: Some(timed_video_in_rx),
         video_out: video_out_tx,
         video_ctl: video_ctl_rx,
         group_ctl,
@@ -3263,7 +3283,12 @@ const VIDEO_DEC_REQUEST: &str = "H264";
 /// `dec` WA Web advertises on an UpgradeAccept.
 const VIDEO_DEC_ACCEPT: &str = "H264,AV1";
 /// WA's native upgrade timer downgrades an unanswered request after five seconds.
-const VIDEO_UPGRADE_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Published because it is a cross-crate contract: clients arm their own
+/// answer-wait against it (a full second under, so device-close latency
+/// cannot lose the race), and a value they cannot see is one they hardcode
+/// around instead of coordinate with.
+pub const VIDEO_UPGRADE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
 enum VideoUpgradeRole {
@@ -3279,28 +3304,39 @@ pub(crate) struct VideoShared {
     ctl_tx: VideoControlSender,
     /// Outbound AUs into the drive loop; a `VideoFeed` pumps the attached source into it.
     in_tx: async_channel::Sender<Vec<u8>>,
+    /// Optional capture-timestamped AUs, kept separate so the legacy source channel remains ABI
+    /// compatible for callers that only provide a fixed cadence.
+    timed_in_tx: async_channel::Sender<VideoInput>,
     /// The CURRENTLY attached sink (swappable: upgrade attaches, downgrade clears). The
     /// out-forwarder task reads it per frame.
     sink_slot: Arc<std::sync::Mutex<Option<async_channel::Sender<VideoFrame>>>>,
     /// The live source feed, aborted on downgrade/replacement.
     feed: std::sync::Mutex<Option<wacore::runtime::AbortHandle>>,
+    generation: AtomicU64,
     /// Receiver halves parked until `attach_engine` hands them to the drive loop.
     receivers: std::sync::Mutex<Option<VideoReceivers>>,
 }
 
 /// The drive-loop halves of the video channels: (outbound AUs, plane control).
-type VideoReceivers = (async_channel::Receiver<Vec<u8>>, VideoControlReceiver);
+type VideoReceivers = (
+    async_channel::Receiver<Vec<u8>>,
+    async_channel::Receiver<VideoInput>,
+    VideoControlReceiver,
+);
 
 impl VideoShared {
     fn new() -> Self {
         let (ctl_tx, ctl_rx) = video_control_channel();
         let (in_tx, in_rx) = async_channel::bounded::<Vec<u8>>(VIDEO_IN_CHANNEL_CAP);
+        let (timed_in_tx, timed_in_rx) = async_channel::bounded::<VideoInput>(VIDEO_IN_CHANNEL_CAP);
         Self {
             ctl_tx,
             in_tx,
+            timed_in_tx,
             sink_slot: Arc::new(std::sync::Mutex::new(None)),
             feed: std::sync::Mutex::new(None),
-            receivers: std::sync::Mutex::new(Some((in_rx, ctl_rx))),
+            generation: AtomicU64::new(0),
+            receivers: std::sync::Mutex::new(Some((in_rx, timed_in_rx, ctl_rx))),
         }
     }
 
@@ -3313,7 +3349,11 @@ impl VideoShared {
             .take()
             .unwrap_or_else(|| {
                 let (_ctl_tx, ctl_rx) = video_control_channel();
-                (async_channel::bounded(1).1, ctl_rx)
+                (
+                    async_channel::bounded(1).1,
+                    async_channel::bounded(1).1,
+                    ctl_rx,
+                )
             })
     }
 
@@ -3330,40 +3370,70 @@ impl VideoShared {
         sink: &Arc<dyn VideoSink>,
         ended: Arc<EndedFlag>,
     ) {
+        // Retire queued AUs before replacing the source. The driver drains legacy input and
+        // generation filtering retires timestamped frames that race with the control.
+        let timed_source = source.timed_frames();
+        let old = self.feed.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(old) = old {
+            old.abort();
+            self.send_control(if timed_source.is_some() {
+                VideoControl::Disable
+            } else {
+                VideoControl::DisableKeepLegacy
+            });
+        }
+        let generation = self
+            .generation
+            .fetch_add(1, PortableOrdering::Relaxed)
+            .wrapping_add(1);
+        self.send_control(VideoControl::SetInputGeneration(generation));
         // Queue timing before the feed can make an AU ready. The driver's control arm is biased
         // ahead of media, so the first RTP timestamp already uses the source's cadence.
         self.send_control(VideoControl::SetTimestampStride(
             source.rtp_timestamp_stride(),
         ));
         *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink.playout());
-        let feed = VideoFeed {
-            source: source.clone(),
-            src: source.frames(),
-            out: self.in_tx.clone(),
-            ended,
+        let handle = if let Some(src) = timed_source {
+            let feed = TimedVideoFeed {
+                source: source.clone(),
+                src,
+                out: self.timed_in_tx.clone(),
+                ended,
+                generation,
+            };
+            client.runtime.spawn(Box::pin(feed.run()))
+        } else {
+            let feed = VideoFeed {
+                source: source.clone(),
+                src: source.frames(),
+                out: self.in_tx.clone(),
+                ended,
+            };
+            client.runtime.spawn(Box::pin(feed.run()))
         };
-        let handle = client.runtime.spawn(Box::pin(feed.run()));
-        // Abort outside the guard: edition 2024 keeps an `if let` scrutinee temporary
-        // alive for the whole matching arm, and a `Runtime` that cancels synchronously
-        // would drop the task inline and re-enter this non-reentrant mutex.
-        let old = self
-            .feed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replace(handle);
-        if let Some(old) = old {
-            old.abort();
-        }
+        *self.feed.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
     /// Release the endpoints (downgrade / refused upgrade): the source feed is aborted, the sink is
     /// dropped, and the drive loop's video plane is disabled so it stops emitting/decoding video.
     fn detach_endpoints(&self) {
-        *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.detach_source();
+        self.detach_sink();
+    }
+
+    /// Drop the local capture feed and gate outbound video off the wire. Inbound keeps decoding,
+    /// so stopping our camera does not lose the picture we are watching.
+    fn detach_source(&self) {
         let feed = self.feed.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(feed) = feed {
             feed.abort();
         }
+        self.send_control(VideoControl::DisableOutbound);
+    }
+
+    /// Drop the attached sink and disable the whole video plane.
+    fn detach_sink(&self) {
+        *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.send_control(VideoControl::Disable);
     }
 }
@@ -3372,6 +3442,31 @@ impl VideoShared {
 fn video_teardown_hook(video: &Arc<VideoShared>) -> Box<dyn Fn() + Send + Sync> {
     let video = video.clone();
     Box::new(move || video.detach_endpoints())
+}
+
+/// Drop a stale pending upgrade's endpoints and gate local capture off the
+/// wire, keeping the inbound sink: the direction-local abort runs while the
+/// peer is still video, so the remote picture must keep flowing. The terminal
+/// teardown hook stays armed for hangup, which still takes the whole plane.
+fn release_local_video_source(
+    pending_outgoing_calls: &std::sync::Mutex<std::collections::HashMap<String, PendingOutgoing>>,
+    video: &VideoShared,
+    call_id: &str,
+    generation: u64,
+) {
+    let pending_video = {
+        // This synchronous map is shared with non-async setup paths; its lock covers only one
+        // lookup/take and is never held across an await.
+        let mut pending = pending_outgoing_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|entry| entry.video.take())
+    };
+    drop(pending_video);
+    video.detach_source();
 }
 
 fn release_video_endpoints(
@@ -3406,6 +3501,51 @@ struct VideoFeed {
     src: async_channel::Receiver<Vec<u8>>,
     out: async_channel::Sender<Vec<u8>>,
     ended: Arc<EndedFlag>,
+}
+
+struct TimedVideoFeed {
+    source: Arc<dyn VideoSource>,
+    src: async_channel::Receiver<TimedVideoFrame>,
+    out: async_channel::Sender<VideoInput>,
+    ended: Arc<EndedFlag>,
+    generation: u64,
+}
+
+impl TimedVideoFeed {
+    async fn run(self) {
+        use futures::FutureExt;
+        let _source = self.source;
+        loop {
+            let ended = self.ended.wait().fuse();
+            let recv = self.src.recv().fuse();
+            futures::pin_mut!(ended, recv);
+            let frame = futures::select_biased! {
+                _ = ended => break,
+                frame = recv => match frame {
+                    Ok(frame) => frame,
+                    Err(_) => break,
+                },
+            };
+            let ended = self.ended.wait().fuse();
+            let send = self
+                .out
+                .send(VideoInput {
+                    data: frame.data,
+                    timestamp: frame.timestamp,
+                    generation: self.generation,
+                })
+                .fuse();
+            futures::pin_mut!(ended, send);
+            futures::select_biased! {
+                _ = ended => break,
+                res = send => {
+                    if res.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl VideoFeed {
@@ -3678,6 +3818,15 @@ impl CallHandle {
     /// counters rather than zeroes.
     pub fn media_stats(&self) -> wacore::voip::CallMediaStats {
         self.media_stats.snapshot()
+    }
+
+    /// The peer captured when this handle was created.
+    ///
+    /// For a direct outgoing call, this is the builder's resolved offer target, not the device
+    /// selected by an inbound accept. It does not change after acceptance, group promotion or
+    /// teardown, and does not consult the identity cache. Use [`Self::peer_jid`] for signaling.
+    pub fn initial_peer_jid(&self) -> &Jid {
+        &self.peer_jid
     }
 
     /// The peer this call is with, as the `<terminate>` target. For an outgoing call this is the
@@ -4007,6 +4156,14 @@ impl CallHandle {
             .unwrap_or(0)
     }
 
+    /// Read back this call's video negotiation state as `(self, peer)`, or `None`
+    /// when the call is gone. Diagnostics for clients driving upgrades from
+    /// outside: confirm what the negotiation holds rather than guessing it.
+    pub fn video_states(&self) -> Option<(VideoState, VideoState)> {
+        self.client_registry
+            .video_states(&self.call_id, self.generation)
+    }
+
     /// Announce this side's camera rotation to the peer, as quarter turns in
     /// `0..=3`. See `CallEntry::self_video_orientation` for what the value is
     /// and what it is not.
@@ -4123,6 +4280,23 @@ impl CallHandle {
         .await
     }
 
+    /// Ask the peer to send a video keyframe, by RTCP PLI.
+    ///
+    /// For the consumer of [`VideoSink`]: call it whenever your decoder loses or
+    /// discards an access unit, which is a loss nothing else here can see.
+    /// Throttled in the engine, so calling on every dropped unit is the intended
+    /// usage rather than an abuse -- including with
+    /// [`KeyframeUrgency::Immediate`], which shortens the interval rather than
+    /// removing it.
+    ///
+    /// Fire-and-forget: the engine decides whether a request goes out, and the
+    /// outcome is not reported back. **Does nothing in a group call** -- see
+    /// [`wacore::voip::CallEngine::request_peer_keyframe`] for why.
+    pub fn request_peer_keyframe(&self, urgency: KeyframeUrgency) {
+        self.video
+            .send_control(VideoControl::RequestPeerKeyframe(urgency));
+    }
+
     /// Send the standalone `<video state=1 dec="H264" device_orientation="0">` used after a
     /// mid-call video upgrade. Captured video-from-start callees do not need this extra stanza.
     pub async fn announce_video_enabled(&self) -> Result<(), CallError> {
@@ -4147,9 +4321,79 @@ impl CallHandle {
         Ok(())
     }
 
-    /// Stop our video direction: sends `<video state=6>` (Stopped, no marker), tears the local
-    /// video plane down, and releases the source/sink. The peer may keep sending its direction;
-    /// audio is untouched. Idempotent.
+    /// Re-ask for video while a local upgrade is outstanding: re-emit
+    /// `<video state=11 dec="H264">` without touching endpoints.
+    ///
+    /// `begin_video(Initiate)` refuses once local video is requested, so an
+    /// upgrade request the peer never answered cannot be asked again through
+    /// it. This mints a fresh epoch under the reached state and sends the
+    /// identical stanza shape; media and teardown hooks stay with the original
+    /// initiation, and a new timeout is armed for the fresh epoch (the old one
+    /// goes inert on the epoch mismatch). A failed send rolls the pending
+    /// epoch back so the previous timeout stays valid instead of stranding the
+    /// upgrade. Refuses without an outstanding local upgrade.
+    pub async fn re_request_video_upgrade(&self) -> Result<(), CallError> {
+        self.ensure_current()?;
+        // Group downgrades also reset video negotiation: take their lane first
+        // like `begin_video` does, so a racing downgrade cannot leave a stale
+        // state=11 in flight for a now-audio group.
+        let group_transition_lock = self
+            .client_registry
+            .group_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _group_transition_guard = group_transition_lock.lock().await;
+        self.ensure_current()?;
+        if let Some(group) = self
+            .client_registry
+            .group_state_if_current(&self.call_id, self.generation)
+            && !group_video_upgrade_allowed(&group)
+        {
+            return Err(CallError::Media(
+                "group media mode does not allow a video upgrade",
+            ));
+        }
+        let transition_lock = self
+            .client_registry
+            .video_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _transition_guard = transition_lock.lock().await;
+        self.ensure_current()?;
+        let client = self.upgrade_client()?;
+        let (previous, epoch) = self
+            .client_registry
+            .re_request_local_video(&self.call_id, self.generation)
+            .ok_or_else(|| {
+                self.unanswerable_upgrade_refusal("no outstanding video upgrade to re-request")
+            })?;
+        let stanza = build_video_state(&VideoStateParams {
+            call_id: &self.call_id,
+            to: &self.peer_jid(),
+            id: &client.generate_request_id(),
+            call_creator: &self.call_creator,
+            state: VideoState::UpgradeRequestV2,
+            dec: Some(VIDEO_DEC_REQUEST),
+            device_orientation: Some(self.local_video_orientation()),
+        });
+        // Arm the timeout before the send: `send_node` awaits, so a caller
+        // cancelling there would otherwise leave the fresh epoch with no live
+        // timeout. On send failure the rollback below restores the previous
+        // epoch, and this timeout then mismatches and no-ops.
+        self.spawn_video_upgrade_timeout(epoch, client.clone());
+        if let Err(e) = client.send_node(stanza).await {
+            self.client_registry.rollback_re_request(
+                &self.call_id,
+                self.generation,
+                previous,
+                epoch,
+            );
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// Stop our video direction: sends `<video state=6>` (Stopped, no marker) and releases only
+    /// the local capture feed. The sink stays attached and inbound keeps decoding, so the peer's
+    /// picture keeps flowing; audio is untouched. Idempotent.
     pub async fn stop_video(&self) -> Result<(), CallError> {
         self.ensure_current()?;
         let transition_lock = self
@@ -4159,9 +4403,8 @@ impl CallHandle {
         let _transition_guard = transition_lock.lock().await;
         self.ensure_current()?;
         // Tear local media down FIRST, matching `Voip::terminate`: the app asked to stop video, so
-        // a failed signaling send must NOT leave the camera streaming. If the peer misses the
-        // Stopped it keeps sending video, but our plane is disabled so those PT-97 packets drop.
-        self.release_local_video();
+        // a failed signaling send must NOT leave the camera streaming.
+        self.stop_local_source();
         self.client_registry
             .stop_local_video(&self.call_id, self.generation);
         let client = self.upgrade_client()?;
@@ -4178,6 +4421,137 @@ impl CallHandle {
         });
         client.send_node(stanza).await?;
         Ok(())
+    }
+
+    /// Re-add our video direction inside an already-video call: re-attaches
+    /// the endpoints, enables the plane ungated, and announces
+    /// `<video state=1 dec="H264" device_orientation="0">`. Unlike
+    /// [`start_video`](Self::start_video) it opens no upgrade handshake and
+    /// arms no timeout, because the call is already video and the peer
+    /// applies a bare `Enabled` unconditionally -- this is the mute-path
+    /// re-add official clients use instead of a second `11`.
+    ///
+    /// Refuses unless our direction is stopped (or never enabled while the
+    /// peer's is) with no upgrade outstanding in either direction: a fresh
+    /// upgrade belongs on `start_video`, and a pending peer request belongs
+    /// on [`accept_video`](Self::accept_video), which answers it explicitly.
+    pub async fn resume_video<S, K>(&self, source: S, sink: K) -> Result<(), CallError>
+    where
+        S: VideoSource,
+        K: VideoSink,
+    {
+        self.ensure_current()?;
+        if source.rtp_timestamp_stride() == 0 {
+            return Err(CallError::Media(
+                "video RTP timestamp stride must be non-zero",
+            ));
+        }
+        let client = self.upgrade_client()?;
+        // Same lanes as `begin_video`: a group downgrade resets video
+        // negotiation, so eligibility, attachment, and the announce are one
+        // transition relative to it, and one video transition at a time.
+        let group_transition_lock = self
+            .client_registry
+            .group_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _group_transition_guard = group_transition_lock.lock().await;
+        self.ensure_current()?;
+        if let Some(group) = self
+            .client_registry
+            .group_state_if_current(&self.call_id, self.generation)
+            && !group_video_upgrade_allowed(&group)
+        {
+            return Err(CallError::Media(
+                "group media mode does not allow a video upgrade",
+            ));
+        }
+        let transition_lock = self
+            .client_registry
+            .video_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _transition_guard = transition_lock.lock().await;
+        self.ensure_current()?;
+        let previous = match self
+            .client_registry
+            .resume_local_video(&self.call_id, self.generation)
+        {
+            Some(previous) => previous,
+            None => return Err(self.unresumable_video_refusal()),
+        };
+        let source: Arc<dyn VideoSource> = Arc::new(source);
+        let sink: Arc<dyn VideoSink> = Arc::new(sink);
+        self.video
+            .attach_endpoints(&client, &source, &sink, self.ended.clone());
+        if !self.client_registry.set_video_teardown(
+            &self.call_id,
+            self.generation,
+            video_teardown_hook(&self.video),
+        ) {
+            self.video.detach_endpoints();
+            self.client_registry
+                .restore_self_video_state(&self.call_id, self.generation, previous);
+            return Err(CallError::Media("call no longer active"));
+        }
+        // The peer is already video, so no accept to wait for.
+        self.video.send_control(VideoControl::Enable);
+        let stanza = build_video_state(&VideoStateParams {
+            call_id: &self.call_id,
+            to: &self.peer_jid(),
+            id: &client.generate_request_id(),
+            call_creator: &self.call_creator,
+            state: VideoState::Enabled,
+            dec: Some(VIDEO_DEC_REQUEST),
+            device_orientation: Some(self.local_video_orientation()),
+        });
+        if let Err(e) = client.send_node(stanza).await {
+            self.release_local_video();
+            self.client_registry
+                .restore_self_video_state(&self.call_id, self.generation, previous);
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// Why a resume just refused: point at the path that owns the current
+    /// state instead of hanging one generic message on every misuse.
+    /// Message-only (the registry owns the rule); a state that raced past
+    /// the refusal keeps the audio-call text.
+    fn unresumable_video_refusal(&self) -> CallError {
+        match self
+            .client_registry
+            .video_states(&self.call_id, self.generation)
+        {
+            Some((VideoState::Enabled, _)) => {
+                CallError::Media("own video direction is already sending")
+            }
+            Some((self_state, _)) if self_state.is_upgrade_request() => {
+                CallError::Media("video upgrade already in progress")
+            }
+            Some((_, peer_state)) if peer_state.is_upgrade_request() => {
+                CallError::Media("answer the peer's upgrade request with accept_video() instead")
+            }
+            Some(_) => CallError::Media(
+                "call has no stopped video direction to resume; use start_video() to upgrade",
+            ),
+            None => CallError::Media("call no longer active"),
+        }
+    }
+
+    fn stop_local_source(&self) {
+        let pending_video = {
+            // This synchronous map is shared with non-async setup paths; its lock covers only one
+            // lookup/take and is never held across an await.
+            let mut pending = self
+                .pending_outgoing_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            pending
+                .get_mut(&self.call_id)
+                .filter(|entry| entry.generation == self.generation)
+                .and_then(|entry| entry.video.take())
+        };
+        drop(pending_video);
+        self.video.detach_source();
     }
 
     /// Release local codec endpoints without changing the directional signaling state.
@@ -4236,7 +4610,9 @@ impl CallHandle {
             VideoUpgradeRole::Initiate => Some(
                 self.client_registry
                     .begin_local_video_request(&self.call_id, self.generation)
-                    .ok_or(CallError::Media("video transition already in progress"))?,
+                    .ok_or_else(|| {
+                        self.unanswerable_upgrade_refusal("video transition already in progress")
+                    })?,
             ),
             VideoUpgradeRole::Accept(request) => {
                 if request.generation() != self.generation
@@ -4354,6 +4730,22 @@ impl CallHandle {
         Ok(())
     }
 
+    /// Why a local upgrade open just refused: an upgrade asked of an
+    /// already-video peer is unanswerable, so say to re-add instead of hanging
+    /// the generic message on it. Message-only (the registry owns the rule);
+    /// a state that raced past the refusal keeps `otherwise`.
+    fn unanswerable_upgrade_refusal(&self, otherwise: &'static str) -> CallError {
+        let peer_active = self
+            .client_registry
+            .video_states(&self.call_id, self.generation)
+            .is_some_and(|(_, peer)| !peer.is_inactive_for_call_mode());
+        CallError::Media(if peer_active {
+            "call already has video; use resume_video() to re-add a stopped direction"
+        } else {
+            otherwise
+        })
+    }
+
     fn spawn_video_upgrade_timeout(&self, epoch: u64, client: Arc<Client>) {
         let runtime = client.runtime.clone();
         let sleeper = runtime.clone();
@@ -4373,6 +4765,34 @@ impl CallHandle {
                     return;
                 };
                 let _transition_guard = transition_lock.lock().await;
+                // The peer stayed video while our request went unanswered: it
+                // ignored the request against its active direction, so there
+                // is no parked peer request to withdraw. Stand only our
+                // direction down with `Stopped`, which the peer applies
+                // without touching its own. The mutual kill below stays for
+                // the initial upgrade, where both directions are down and the
+                // peer may still hold our request.
+                if registry.abort_local_video_request(&call_id, generation, epoch) {
+                    release_local_video_source(&pending, &video, &call_id, generation);
+                    let Some(client) = weak_client.upgrade() else {
+                        return;
+                    };
+                    let stanza = build_video_state(&VideoStateParams {
+                        call_id: &call_id,
+                        to: &peer,
+                        id: &client.generate_request_id(),
+                        call_creator: &call_creator,
+                        state: VideoState::Stopped,
+                        dec: None,
+                        device_orientation: None,
+                    });
+                    if let Err(e) = client.send_node(stanza).await {
+                        warn!(
+                            "voip: failed to announce video upgrade abort call_id={call_id}: {e}"
+                        );
+                    }
+                    return;
+                }
                 if !registry.end_local_video_request(&call_id, generation, epoch) {
                     return;
                 }
@@ -4519,7 +4939,7 @@ impl CallHandle {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use async_trait::async_trait;
@@ -10502,6 +10922,20 @@ mod tests {
         timestamp_stride: u32,
     }
 
+    struct TimedCaptureSource {
+        frames: async_channel::Receiver<TimedVideoFrame>,
+    }
+
+    impl VideoSource for TimedCaptureSource {
+        fn frames(&self) -> async_channel::Receiver<Vec<u8>> {
+            async_channel::bounded(1).1
+        }
+
+        fn timed_frames(&self) -> Option<async_channel::Receiver<TimedVideoFrame>> {
+            Some(self.frames.clone())
+        }
+    }
+
     impl VideoSource for TimedVideoSource {
         fn frames(&self) -> async_channel::Receiver<Vec<u8>> {
             self.frames.clone()
@@ -10515,6 +10949,16 @@ mod tests {
     struct DropTrackedVideoSource {
         frames: async_channel::Receiver<Vec<u8>>,
         drops: Arc<AtomicUsize>,
+    }
+
+    struct ChannelVideoSink {
+        playout: async_channel::Sender<VideoFrame>,
+    }
+
+    impl VideoSink for ChannelVideoSink {
+        fn playout(&self) -> async_channel::Sender<VideoFrame> {
+            self.playout.clone()
+        }
     }
 
     impl VideoSource for DropTrackedVideoSource {
@@ -10834,6 +11278,57 @@ mod tests {
                 .expect("session")
                 .is_video,
             "start_video must mark the session as video"
+        );
+        handle.hangup_local().await;
+    }
+
+    // Re-request path: identical stanza shape under a fresh epoch.
+    #[tokio::test]
+    async fn re_request_video_upgrade_resends_request_shape_on_live_video() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle
+            .re_request_video_upgrade()
+            .await
+            .expect("re-request on live video");
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("re-request must be sent")
+            .expect("waiter");
+        let r = node.as_node_ref();
+        assert!(
+            r.attrs()
+                .optional_string("id")
+                .is_some_and(|id| !id.is_empty()),
+            "the <call> wrapper needs an id so the peer's typed video ack correlates"
+        );
+        let action = call_action_of(&node);
+        let ar = action.as_node_ref();
+        assert_eq!(ar.tag, "video");
+        assert_eq!(ar.attrs().optional_string("state").as_deref(), Some("11"));
+        assert_eq!(ar.attrs().optional_string("dec").as_deref(), Some("H264"));
+        assert_eq!(
+            ar.attrs().optional_string("device_orientation").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            ar.attrs().optional_string("voip_settings").as_deref(),
+            Some("video"),
+            "the re-request must carry the marker attr like the initial request"
+        );
+        handle.hangup_local().await;
+    }
+
+    // Audio-only calls stay on the begin path: with no video state there is
+    // nothing to re-request.
+    #[tokio::test]
+    async fn re_request_video_upgrade_refuses_audio_only_call() {
+        let (_client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        assert!(
+            handle.re_request_video_upgrade().await.is_err(),
+            "audio-only call must refuse the re-request"
         );
         handle.hangup_local().await;
     }
@@ -11229,8 +11724,375 @@ mod tests {
         handle.hangup_local().await;
     }
 
+    async fn apply_paused_peer(handle: &CallHandle) {
+        let transition_lock = handle
+            .client_registry
+            .video_transition_lock(&handle.call_id, handle.generation)
+            .expect("active call");
+        let _guard = transition_lock.lock().await;
+        assert!(matches!(
+            handle.client_registry.apply_peer_video_state(
+                &handle.call_id,
+                handle.generation,
+                VideoState::Paused,
+            ),
+            wacore::voip::PeerVideoTransition::Applied { .. }
+        ));
+    }
+
+    // An upgrade asked of a peer that is already video is unanswerable, so
+    // the begin refuses and names the re-add instead of arming the kill-timer.
     #[tokio::test]
-    async fn stop_video_sends_stopped_and_releases_endpoints() {
+    async fn start_video_refuses_when_peer_video_is_up() {
+        let (client, sends, handle, _relay_keepalive) = sending_handle().await;
+        apply_paused_peer(&handle).await;
+        let (vsrc, vsink) = video_endpoints();
+        let err = handle
+            .start_video(vsrc, vsink)
+            .await
+            .expect_err("an upgrade the peer would ignore must be refused");
+        assert!(
+            matches!(err, CallError::Media(msg) if msg.contains("resume_video")),
+            "the refusal must name the re-add, got: {err}"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "refusal sends nothing");
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_none(),
+            "refusal attaches nothing"
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .video_states(&handle.call_id, handle.generation),
+            Some((VideoState::Disabled, VideoState::Paused)),
+            "the refusal must not disturb the negotiation"
+        );
+        handle.hangup_local().await;
+    }
+
+    // The retry of an unanswerable upgrade is unanswerable too.
+    #[tokio::test]
+    async fn re_request_refuses_when_peer_went_video_mid_handshake() {
+        let (_client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        apply_paused_peer(&handle).await;
+        assert!(
+            handle.re_request_video_upgrade().await.is_err(),
+            "re-asking an active peer must be refused like asking"
+        );
+        handle.hangup_local().await;
+    }
+
+    // The timeout's direction-local half end to end: our upgrade goes
+    // unanswered against a peer that stayed video, so the timer stands our
+    // direction down with `Stopped` instead of killing both with `9`.
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_upgrade_against_an_active_peer_stands_down_locally() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let video = Arc::new(VideoShared::new());
+        let (event_tx, events) = async_channel::unbounded::<CallEvent>();
+        registry.set_video_channels(
+            "CID-FACADE",
+            generation,
+            event_tx,
+            video.ctl_tx.clone(),
+            video_teardown_hook(&video),
+        );
+        let handle = CallHandle {
+            call_id: "CID-FACADE".into(),
+            generation,
+            peer_jid: caller(),
+            call_creator: caller(),
+            client_registry: registry.clone(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
+            client: Arc::downgrade(&client),
+            muted: Arc::new(AtomicBool::new(false)),
+            video: video.clone(),
+            events,
+            ended: Arc::new(EndedFlag::default()),
+            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
+        };
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_frames_tx, frames) = async_channel::unbounded();
+        let source = DropTrackedVideoSource {
+            frames,
+            drops: drops.clone(),
+        };
+        let (sink_tx, _sink_rx) = async_channel::unbounded::<VideoFrame>();
+        let sink = ChannelVideoSink { playout: sink_tx };
+        std::mem::forget(_sink_rx);
+        handle
+            .start_video(source, sink)
+            .await
+            .expect("request sent");
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        apply_paused_peer(&handle).await;
+
+        let timeout_waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        tokio::task::yield_now().await;
+        tokio::time::advance(VIDEO_UPGRADE_TIMEOUT).await;
+        for _ in 0..10 {
+            if drops.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        let timeout_node = timeout_waiter.await.expect("timeout stanza");
+        let timeout_action = call_action_of(&timeout_node);
+        assert_eq!(
+            timeout_action
+                .as_node_ref()
+                .attrs()
+                .optional_string("state")
+                .as_deref(),
+            Some("6"),
+            "an unanswered upgrade against an active peer stands down locally, it does not cancel both"
+        );
+        assert!(
+            registry.snapshot("CID-FACADE").unwrap().is_video,
+            "the peer's direction keeps the call video"
+        );
+        assert_eq!(
+            registry.video_states("CID-FACADE", generation),
+            Some((VideoState::Stopped, VideoState::Paused))
+        );
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_some(),
+            "a direction-local abort must not drop the peer's picture"
+        );
+        handle.hangup_local().await;
+    }
+
+    async fn apply_upgrade_accept(handle: &CallHandle) {
+        let transition_lock = handle
+            .client_registry
+            .video_transition_lock(&handle.call_id, handle.generation)
+            .expect("active call");
+        let _guard = transition_lock.lock().await;
+        assert!(matches!(
+            handle.client_registry.apply_peer_video_state(
+                &handle.call_id,
+                handle.generation,
+                VideoState::UpgradeAccept,
+            ),
+            wacore::voip::PeerVideoTransition::Applied {
+                enable_plane: true,
+                ..
+            }
+        ));
+    }
+
+    // The mute-path re-add end to end: a stopped direction inside an
+    // already-video call returns ungated with a bare `Enabled` (no handshake,
+    // no marker, no timeout), and both directions read enabled afterwards.
+    #[tokio::test]
+    async fn resume_video_re_adds_a_stopped_direction_ungated() {
+        let (client, sends, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        apply_upgrade_accept(&handle).await;
+        handle.stop_video().await.expect("stop_video");
+        assert_eq!(
+            client
+                .call_registry()
+                .video_states(&handle.call_id, handle.generation),
+            Some((VideoState::Stopped, VideoState::Enabled))
+        );
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let (vsrc, vsink) = video_endpoints();
+        handle
+            .resume_video(vsrc, vsink)
+            .await
+            .expect("resume_video");
+        assert_eq!(sends.load(Ordering::SeqCst), 3);
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("re-add must be announced")
+            .expect("waiter");
+        let action = call_action_of(&node);
+        let ar = action.as_node_ref();
+        assert_eq!(ar.tag, "video");
+        assert_eq!(ar.attrs().optional_string("state").as_deref(), Some("1"));
+        assert_eq!(ar.attrs().optional_string("dec").as_deref(), Some("H264"));
+        assert_eq!(
+            ar.attrs().optional_string("device_orientation").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            ar.attrs().optional_string("voip_settings"),
+            None,
+            "a re-add is not an upgrade request and must not carry the marker"
+        );
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_some(),
+            "resume_video attaches the sink"
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .video_states(&handle.call_id, handle.generation),
+            Some((VideoState::Enabled, VideoState::Enabled))
+        );
+        assert!(
+            client
+                .call_registry()
+                .snapshot(&handle.call_id)
+                .expect("session")
+                .is_video
+        );
+        handle.hangup_local().await;
+    }
+
+    // A fresh upgrade is not a re-add.
+    #[tokio::test]
+    async fn resume_video_refuses_an_audio_call() {
+        let (_client, sends, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        let err = handle
+            .resume_video(vsrc, vsink)
+            .await
+            .expect_err("an audio call has no direction to re-add");
+        assert!(
+            matches!(err, CallError::Media(msg) if msg.contains("start_video")),
+            "the refusal must point at the upgrade path, got: {err}"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "refusal sends nothing");
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_none(),
+            "refusal attaches nothing"
+        );
+        handle.hangup_local().await;
+    }
+
+    // A pending peer request is answered explicitly, not consumed implicitly.
+    #[tokio::test]
+    async fn resume_video_refuses_a_pending_peer_request() {
+        let (_client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let _token = peer_upgrade_request(&handle).await;
+        let (vsrc, vsink) = video_endpoints();
+        let err = handle
+            .resume_video(vsrc, vsink)
+            .await
+            .expect_err("a peer request belongs on accept_video");
+        assert!(
+            matches!(err, CallError::Media(msg) if msg.contains("accept_video")),
+            "the refusal must point at the accept path, got: {err}"
+        );
+        handle.hangup_local().await;
+    }
+
+    // The previously stuck cell end to end: a paused peer keeps the call
+    // video, so the begin path refuses and the re-add must take it. A bare
+    // `Enabled` is what an already-video peer answers.
+    #[tokio::test]
+    async fn resume_video_re_adds_against_a_paused_peer() {
+        let (client, sends, handle, _relay_keepalive) = sending_handle().await;
+        apply_paused_peer(&handle).await;
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let (vsrc, vsink) = video_endpoints();
+        handle
+            .resume_video(vsrc, vsink)
+            .await
+            .expect("a paused peer still holds the call video");
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("re-add must be announced")
+            .expect("waiter");
+        assert_eq!(
+            call_action_of(&node)
+                .as_node_ref()
+                .attrs()
+                .optional_string("state")
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .video_states(&handle.call_id, handle.generation),
+            Some((VideoState::Enabled, VideoState::Paused))
+        );
+        handle.hangup_local().await;
+    }
+
+    // A re-add whose stanza never reaches the peer releases the plane and
+    // restores the stopped direction, so a retry stays a resume.
+    #[tokio::test]
+    async fn resume_video_send_failure_restores_stopped_and_releases() {
+        let (client, _sent) = make_sending_client_with_failure_after(Some(0)).await;
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let video = Arc::new(VideoShared::new());
+        let (event_tx, events) = async_channel::unbounded::<CallEvent>();
+        registry.set_video_channels(
+            "CID-FACADE",
+            generation,
+            event_tx,
+            video.ctl_tx.clone(),
+            video_teardown_hook(&video),
+        );
+        let handle = CallHandle {
+            call_id: "CID-FACADE".into(),
+            generation,
+            peer_jid: caller(),
+            call_creator: caller(),
+            client_registry: registry.clone(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
+            client: Arc::downgrade(&client),
+            muted: Arc::new(AtomicBool::new(false)),
+            video: video.clone(),
+            events,
+            ended: Arc::new(EndedFlag::default()),
+            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
+        };
+        assert!(registry.stop_local_video("CID-FACADE", generation));
+        {
+            let transition_lock = registry
+                .video_transition_lock("CID-FACADE", generation)
+                .expect("active call");
+            let _guard = transition_lock.lock().await;
+            assert!(matches!(
+                registry.apply_peer_video_state("CID-FACADE", generation, VideoState::Enabled,),
+                wacore::voip::PeerVideoTransition::Applied { .. }
+            ));
+        }
+
+        let (source, sink) = video_endpoints();
+        assert!(handle.resume_video(source, sink).await.is_err());
+        assert!(video.sink_slot.lock().unwrap().is_none());
+        assert_eq!(
+            registry.video_states("CID-FACADE", generation),
+            Some((VideoState::Stopped, VideoState::Enabled))
+        );
+        assert!(registry.snapshot("CID-FACADE").unwrap().is_video);
+        handle.hangup_local().await;
+    }
+
+    // A caller stopping its camera must not lose the picture it is
+    // watching: the peer is still sending, so only the local feed goes.
+    #[tokio::test]
+    async fn stop_video_keeps_the_incoming_sink_attached() {
+        let (_client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        handle.stop_video().await.expect("stop_video");
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_some(),
+            "the remote picture must keep flowing after our camera stops"
+        );
+        handle.hangup_local().await;
+    }
+
+    #[tokio::test]
+    async fn stop_video_sends_stopped_and_keeps_the_remote_sink() {
         let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
         let (vsrc, vsink) = video_endpoints();
         handle.start_video(vsrc, vsink).await.expect("start_video");
@@ -11255,8 +12117,17 @@ mod tests {
             "a downgrade must NOT carry the marker (it re-arms the peer's video)"
         );
         assert!(
-            handle.video.sink_slot.lock().unwrap().is_none(),
-            "stop_video releases the sink"
+            handle.video.sink_slot.lock().unwrap().is_some(),
+            "stopping our camera must not drop the peer's picture"
+        );
+        assert!(
+            handle
+                .video
+                .feed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "stopping our camera must stop the local capture feed"
         );
         assert!(
             !client
@@ -11323,7 +12194,7 @@ mod tests {
     async fn video_feed_forwards_and_stops_on_ended() {
         let client = make_client().await;
         let shared = VideoShared::new();
-        let (in_rx, ctl_rx) = shared.take_receivers();
+        let (in_rx, _timed_rx, ctl_rx) = shared.take_receivers();
         let (src_tx, src_rx) = async_channel::unbounded::<Vec<u8>>();
         let sink: Arc<dyn VideoSink> = {
             let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
@@ -11337,6 +12208,10 @@ mod tests {
         let ended = Arc::new(EndedFlag::default());
         shared.attach_endpoints(&client, &source, &sink, ended.clone());
 
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetInputGeneration(1)
+        );
         assert_eq!(
             ctl_rx.recv().await.unwrap(),
             VideoControl::SetTimestampStride(4500)
@@ -11360,6 +12235,91 @@ mod tests {
             after.is_err(),
             "an AU sent after ended must not be forwarded (feed stopped)"
         );
+    }
+
+    #[tokio::test]
+    async fn timed_video_feed_forwards_capture_timestamp() {
+        let client = make_client().await;
+        let shared = VideoShared::new();
+        let (_legacy_rx, timed_rx, ctl_rx) = shared.take_receivers();
+        let (src_tx, src_rx) = async_channel::unbounded::<TimedVideoFrame>();
+        let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
+        let source_impl = Arc::new(TimedCaptureSource { frames: src_rx });
+        assert!(
+            source_impl.frames().is_closed(),
+            "timed sources may leave legacy input closed"
+        );
+        let source: Arc<dyn VideoSource> = source_impl;
+        let sink: Arc<dyn VideoSink> = Arc::new(vout_tx);
+        shared.attach_endpoints(&client, &source, &sink, Arc::new(EndedFlag::default()));
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetInputGeneration(1)
+        );
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetTimestampStride(6000)
+        );
+        src_tx
+            .send(TimedVideoFrame {
+                data: vec![1, 2, 3],
+                timestamp: 12_000,
+            })
+            .await
+            .unwrap();
+        let forwarded = timed_rx.recv().await.unwrap();
+        assert_eq!(forwarded.data, vec![1, 2, 3]);
+        assert_eq!(forwarded.timestamp, 12_000);
+        assert_eq!(forwarded.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_video_reattach_keeps_new_first_au_before_disable_is_consumed() {
+        let client = make_client().await;
+        let shared = VideoShared::new();
+        let (in_rx, _timed_rx, ctl_rx) = shared.take_receivers();
+        let (old_tx, old_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (new_tx, new_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
+        let sink: Arc<dyn VideoSink> = Arc::new(vout_tx);
+        let old: Arc<dyn VideoSource> = Arc::new(TimedVideoSource {
+            frames: old_rx,
+            timestamp_stride: 6000,
+        });
+        let new: Arc<dyn VideoSource> = Arc::new(TimedVideoSource {
+            frames: new_rx,
+            timestamp_stride: 6000,
+        });
+        let ended = Arc::new(EndedFlag::default());
+        shared.attach_endpoints(&client, &old, &sink, ended.clone());
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetInputGeneration(1)
+        );
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetTimestampStride(6000)
+        );
+        shared.attach_endpoints(&client, &new, &sink, ended);
+        new_tx.send(vec![7, 7, 7]).await.unwrap();
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::DisableKeepLegacy
+        );
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetInputGeneration(2)
+        );
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetTimestampStride(6000)
+        );
+        let got = tokio::time::timeout(Duration::from_secs(2), in_rx.recv())
+            .await
+            .expect("new AU must not be drained")
+            .expect("channel open");
+        assert_eq!(got, vec![7, 7, 7]);
+        drop(old_tx);
     }
 
     /// Runs a caller-supplied hook inline on `abort()`, standing in for a `Runtime` that
@@ -11476,7 +12436,7 @@ mod tests {
     fn video_shared_second_take_yields_closed_channels() {
         let shared = VideoShared::new();
         let _live = shared.take_receivers();
-        let (in_rx, ctl_rx) = shared.take_receivers();
+        let (in_rx, _timed_rx, ctl_rx) = shared.take_receivers();
         assert!(in_rx.is_closed());
         assert!(ctl_rx.is_closed());
     }
@@ -11484,7 +12444,7 @@ mod tests {
     #[test]
     fn video_control_queue_preserves_state_and_coalesces_orientation() {
         let shared = VideoShared::new();
-        let (_in_rx, ctl_rx) = shared.take_receivers();
+        let (_in_rx, _timed_rx, ctl_rx) = shared.take_receivers();
         shared.send_control(VideoControl::Disable);
         for orientation in 0..100u8 {
             shared.send_control(VideoControl::SetOrientation(orientation % 4));

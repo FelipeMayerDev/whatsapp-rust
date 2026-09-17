@@ -222,7 +222,8 @@ mod device_info_tests {
     use super::DeviceInfo;
 
     /// The packed layout is the whole point; a field added carelessly would
-    /// undo it silently.
+    /// undo it silently. Exact: the packing is the contract. Rebaseline per
+    /// [layout asserts](../../../agent_docs/layout_asserts.md).
     #[test]
     fn a_device_entry_is_eight_bytes() {
         assert_eq!(size_of::<DeviceInfo>(), 8);
@@ -292,10 +293,16 @@ mod device_info_tests {
     /// The record is held per known contact for the life of a cache entry, so
     /// its inline size is part of the budget: `Arc<str>` + `Box<[_]>` +
     /// `Option<Box<str>>` rather than `String` + `Vec` + `Option<String>` is
-    /// what keeps it at 64 bytes instead of 88.
+    /// what keeps it within 64 bytes instead of 88. Budget, not contract:
+    /// a smaller record is never a failure. Rebaseline per
+    /// [layout asserts](../../../agent_docs/layout_asserts.md).
     #[test]
-    fn a_device_list_record_is_sixty_four_bytes() {
-        assert_eq!(size_of::<super::DeviceListRecord>(), 64);
+    fn a_device_list_record_fits_sixty_four_bytes() {
+        assert!(
+            size_of::<super::DeviceListRecord>() <= 64,
+            "DeviceListRecord grew to {} B (budget 64)",
+            size_of::<super::DeviceListRecord>()
+        );
     }
 
     /// The record now serializes through a shadow struct; the blob it writes
@@ -563,6 +570,17 @@ pub trait SignalStore: Send + Sync {
     /// Delete an identity key.
     async fn delete_identity(&self, address: &str) -> Result<()>;
 
+    /// Delete several identity keys. The flush issues one call per address
+    /// it dropped, and an identity reset drops many at once, so a backend with
+    /// transactions should override this with a single one; the default is the
+    /// per-address loop.
+    async fn delete_identities_batch(&self, addresses: &[Arc<str>]) -> Result<()> {
+        for address in addresses {
+            self.delete_identity(address).await?;
+        }
+        Ok(())
+    }
+
     // --- Session Operations ---
 
     /// Get an encrypted session for an address.
@@ -580,8 +598,33 @@ pub trait SignalStore: Send + Sync {
         Ok(())
     }
 
+    /// Load multiple encrypted sessions in a single backend operation.
+    /// Returns only the addresses that exist, like [`Self::load_prekeys_batch`].
+    /// Default implementation falls back to individual `get_session` calls.
+    /// Addresses are `Arc<str>` so a caller holding the cache's keys passes
+    /// shared refs without allocating a `String` per entry.
+    async fn get_sessions_batch(&self, addresses: &[Arc<str>]) -> Result<Vec<(Arc<str>, Bytes)>> {
+        let mut result = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            if let Some(session) = self.get_session(address).await? {
+                result.push((address.clone(), session));
+            }
+        }
+        Ok(result)
+    }
+
     /// Delete a session.
     async fn delete_session(&self, address: &str) -> Result<()>;
+
+    /// Delete several sessions in one backend operation. Same contract as
+    /// [`Self::delete_identities_batch`]: the default loops, a transactional
+    /// backend should not.
+    async fn delete_sessions_batch(&self, addresses: &[Arc<str>]) -> Result<()> {
+        for address in addresses {
+            self.delete_session(address).await?;
+        }
+        Ok(())
+    }
 
     /// Check if a session exists. Default implementation uses `get_session`.
     async fn has_session(&self, address: &str) -> Result<bool> {
@@ -636,6 +679,16 @@ pub trait SignalStore: Send + Sync {
     /// Remove a pre-key.
     async fn remove_prekey(&self, id: u32) -> Result<()>;
 
+    /// Remove several pre-keys in one backend operation: an offline drain
+    /// consumes one per `pkmsg`, and the flush deletes them together once
+    /// their sessions are durable. The default loops.
+    async fn remove_prekeys_batch(&self, ids: &[u32]) -> Result<()> {
+        for id in ids {
+            self.remove_prekey(*id).await?;
+        }
+        Ok(())
+    }
+
     /// Get the maximum pre-key ID currently stored, or 0 if none exist.
     /// Used for migration when `next_pre_key_id` counter is not yet initialized.
     async fn get_max_prekey_id(&self) -> Result<u32>;
@@ -673,6 +726,14 @@ pub trait SignalStore: Send + Sync {
 
     /// Delete a sender key.
     async fn delete_sender_key(&self, address: &str) -> Result<()>;
+
+    /// Delete several sender keys in one backend operation. The default loops.
+    async fn delete_sender_keys_batch(&self, addresses: &[Arc<str>]) -> Result<()> {
+        for address in addresses {
+            self.delete_sender_key(address).await?;
+        }
+        Ok(())
+    }
 }
 
 /// WhatsApp app state synchronization storage.
@@ -741,6 +802,33 @@ pub trait AppSyncStore: Send + Sync {
 
     /// Delete mutation MACs by their index MACs.
     async fn delete_mutation_macs(&self, name: &str, index_macs: &[Vec<u8>]) -> Result<()>;
+
+    /// Persist one applied patch as a unit: the collection's new version, the
+    /// index MACs the patch removed and the MACs it added.
+    ///
+    /// The default issues the three single-purpose writes in that order, so a
+    /// backend without transactions keeps its current behaviour. A backend
+    /// with them should override this with one: a paged incremental sync
+    /// commits hundreds of small patches, and on SQLite each write was its own
+    /// permit, `spawn_blocking` and WAL commit — two thirds of what a small
+    /// patch cost to persist.
+    async fn commit_patch(
+        &self,
+        name: &str,
+        state: HashState,
+        removed_index_macs: &[Vec<u8>],
+        added: &[AppStateMutationMAC],
+    ) -> Result<()> {
+        let version = state.version;
+        self.set_version(name, state).await?;
+        if !removed_index_macs.is_empty() {
+            self.delete_mutation_macs(name, removed_index_macs).await?;
+        }
+        if !added.is_empty() {
+            self.put_mutation_macs(name, version, added).await?;
+        }
+        Ok(())
+    }
 
     /// Delete every mutation MAC for a collection. Called on snapshot re-sync so the
     /// MAC store is rebuilt from the snapshot, matching the ltHash baseline; leftover
@@ -830,6 +918,16 @@ pub trait ProtocolStore: Send + Sync {
     /// Delete a base key entry.
     async fn delete_base_key(&self, address: &str, message_id: &str) -> Result<()>;
 
+    /// Delete base keys recorded before `cutoff_timestamp` (unix seconds).
+    /// Returns the count deleted.
+    ///
+    /// A benign `Ok(0)` default rather than an `unsupported` error, for the same
+    /// reason as [`delete_expired_pending_inbound`](Self::delete_expired_pending_inbound):
+    /// the keepalive sweep calls it unconditionally for every backend.
+    async fn delete_expired_base_keys(&self, _cutoff_timestamp: i64) -> Result<u32> {
+        Ok(0)
+    }
+
     // --- Device Registry ---
 
     /// Update the device list for a user (called after usync responses).
@@ -848,6 +946,22 @@ pub trait ProtocolStore: Send + Sync {
 
     /// Get all known devices for a user.
     async fn get_devices(&self, user: &str) -> Result<Option<DeviceListRecord>>;
+
+    /// Batched variant of `get_devices`: the records stored under any of
+    /// `users`, in no particular order, with absent users left out. Backends
+    /// should override with one query; the default loops for correctness.
+    /// Resolving a cold large group reads one record per member, and a
+    /// round trip per member through the write queue cost ~30x one
+    /// `IN (...)` query at 256 members on SQLite.
+    async fn get_devices_batch(&self, users: &[&str]) -> Result<Vec<DeviceListRecord>> {
+        let mut records = Vec::with_capacity(users.len());
+        for user in users {
+            if let Some(record) = self.get_devices(user).await? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
 
     /// Delete a device list record, forcing a network re-fetch on next query.
     async fn delete_devices(&self, user: &str) -> Result<()>;
@@ -878,6 +992,21 @@ pub trait ProtocolStore: Send + Sync {
 
     /// Get a trusted contact token for a JID (stored under LID).
     async fn get_tc_token(&self, jid: &str) -> Result<Option<TcTokenEntry>>;
+
+    /// Get the trusted contact tokens for several JIDs at once, in the order
+    /// asked, `None` where the backend holds no row.
+    ///
+    /// The reconnect presence re-subscribe looks one of these up per tracked
+    /// contact, which is a query per contact against one store — the shape this
+    /// exists to collapse. The default is a loop for third-party backends; the
+    /// built-in stores override it with a single query.
+    async fn get_tc_tokens(&self, jids: &[String]) -> Result<Vec<Option<TcTokenEntry>>> {
+        let mut entries = Vec::with_capacity(jids.len());
+        for jid in jids {
+            entries.push(self.get_tc_token(jid).await?);
+        }
+        Ok(entries)
+    }
 
     /// Store or update a trusted contact token for a JID.
     async fn put_tc_token(&self, jid: &str, entry: &TcTokenEntry) -> Result<()>;
@@ -978,6 +1107,21 @@ pub trait ProtocolStore: Send + Sync {
         message_id: &str,
         payload: &[u8],
     ) -> Result<()>;
+
+    /// Read a sent payload without removing it or refreshing its expiry.
+    /// Cancellation, including detached backend I/O, must leave the row unchanged.
+    /// Backends without this read return an error rather than emulate it with
+    /// take + store, which can lose the payload on cancellation.
+    async fn get_sent_message(
+        &self,
+        _chat_jid: &str,
+        _message_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        Err(crate::store::error::StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "backend does not support non-consuming sent-message reads",
+        )))
+    }
 
     /// Retrieve and delete a sent message (atomic take). Returns serialized payload.
     /// Called when a retry receipt arrives; consuming prevents double-retry.
@@ -1112,6 +1256,22 @@ pub trait DeviceStore: Send + Sync {
     /// non-breaking, exactly like [`Self::snapshot_db`].
     async fn resource_report(&self) -> crate::stats::StorageResourceReport {
         crate::stats::StorageResourceReport::default()
+    }
+
+    /// Periodic engine upkeep the client calls on a coarse timer (roughly
+    /// hourly) while connected — statistics refresh, log truncation, whatever a
+    /// backend needs to stay in shape across a session measured in weeks rather
+    /// than minutes.
+    ///
+    /// Defaulted to a no-op and placed on `DeviceStore` for the same reason as
+    /// [`Self::resource_report`]: a default on an already-implemented sub-trait
+    /// composes through `Arc<dyn Backend>` without forcing every external
+    /// backend to add an impl. It must be cheap enough to run on a live
+    /// connection and safe to call when nothing has changed; anything that takes
+    /// an exclusive lock on the whole database (SQLite's `VACUUM`) belongs in an
+    /// explicit embedder call, not here.
+    async fn maintenance(&self) -> Result<()> {
+        Ok(())
     }
 }
 

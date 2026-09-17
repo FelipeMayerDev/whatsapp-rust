@@ -1,5 +1,5 @@
 use crate::client::Client;
-use crate::types::events::{Event, Receipt};
+use crate::types::events::{Event, EventKind, Receipt};
 use crate::types::message::MessageInfo;
 use crate::types::presence::ReceiptType;
 use log::debug;
@@ -566,16 +566,42 @@ impl Client {
     pub(crate) fn handle_receipt_inline(self: &Arc<Self>, node: Arc<OwnedNodeRef>) {
         let nr = node.get();
         let mut attrs = nr.attrs();
-        let from = attrs.jid("from");
+        // `type` is read before anything else because it is the only attribute
+        // the subscriber gate below needs, and this runs on the read loop: a
+        // client with no Receipt handler is meant to leave here having parsed
+        // one attribute, not the whole stanza. `<receipt>` reaches this
+        // function inline exactly when nothing is subscribed
+        // (`processes_inline`), so that is the common case, not the rare one.
+        let receipt_type_cow = attrs.optional_string("type");
+        let receipt_type_str = receipt_type_cow.as_deref().unwrap_or("delivery");
+        let receipt_type = ReceiptType::parse(receipt_type_str);
+        // `id` is the one other attribute read ahead of the gate: a receipt
+        // without one is a protocol error worth the warning whether or not
+        // anything is subscribed, and the read is a single inline copy.
         let stanza_id = match attrs.optional_string("id") {
-            Some(id) => id.to_string(),
+            Some(id) => wacore_binary::MessageId::from(id.as_ref()),
             None => {
                 log::warn!("Receipt stanza missing required 'id' attribute");
                 return;
             }
         };
-        let receipt_type_cow = attrs.optional_string("type");
-        let receipt_type_str = receipt_type_cow.as_deref().unwrap_or("delivery");
+        // Retries feed the resend pipeline whether or not anything listens.
+        // Every other receipt, `enc_rekey_retry` included (its branch below
+        // only logs and dispatches), exists only to become an `Event::Receipt`,
+        // which `dispatch` drops on the floor without a subscriber — so
+        // without one, stop before the `from` JID, the `<participants>` scan
+        // (one `Jid` pair per member of a group read) and the message-id list.
+        //
+        // Gating on the raw parsed type is what lets the gate come first:
+        // `downgrade_for_feature_incapable` below only ever rewrites
+        // `Delivered` to `Sent`, so no stanza it touches can turn into the
+        // `Retry` this gate lets through.
+        if receipt_type != ReceiptType::Retry
+            && !self.core.event_bus.has_handler_for(EventKind::Receipt)
+        {
+            return;
+        }
+        let from = attrs.jid("from");
         let participant = attrs.optional_jid("participant");
         let recipient = attrs.optional_jid("recipient");
         // participant_pn -> sender_alt so the LID-PN cache warms from receipts too.
@@ -588,7 +614,6 @@ impl Client {
             .and_then(wacore::time::from_secs)
             .unwrap_or_else(wacore::time::now_utc);
 
-        let receipt_type = ReceiptType::parse(receipt_type_str);
         // WA Web downgrades a delivery ack to "sent" (not delivered) when the receipt carries
         // <error reason="lid" type="feature-incapable"> (the LID peer can't receive it).
         let receipt_type =
@@ -615,12 +640,14 @@ impl Client {
         if let Some(part_node) = nr.get_optional_child("participants") {
             let (agg_msg_id, agg_key, users) =
                 wacore::stanza::receipt::parse_participants(part_node);
-            // The event's `message_ids` are `String`, so the borrowed compact id
-            // is widened once here instead of cloning both candidates first.
-            let fan_out_id: String = agg_msg_id
+            // The event's `message_ids` are owned `MessageId`s, so the borrowed
+            // id is copied into one (inline on 64-bit targets for an ordinary
+            // 22-character id) once here instead of cloning both candidates
+            // first.
+            let fan_out_id: wacore_binary::MessageId = agg_msg_id
                 .as_deref()
                 .or(agg_key.as_deref())
-                .map(String::from)
+                .map(wacore_binary::MessageId::from)
                 .unwrap_or_else(|| stanza_id.clone());
             debug!(
                 "Aggregated receipt from {}: stanza={stanza_id} \
@@ -829,11 +856,7 @@ impl Client {
         // them before the deferred retry flushes would trade a redeliverable
         // failure for a crash-permanent one. Completion of the deferred
         // transition flushes this buffer (after its durable flush).
-        if self
-            .offline_sync_completed
-            .load(std::sync::atomic::Ordering::Acquire)
-            && !self.inbound_commit_batch.is_active()
-        {
+        if !self.inbound_commit_batch.is_active() {
             return false;
         }
         buffer.push(Arc::clone(info));
@@ -1133,7 +1156,7 @@ mod tests {
 
     fn info_with(chat: &str, sender: &str, is_group: bool) -> MessageInfo {
         MessageInfo {
-            id: "MID".to_string(),
+            id: "MID".into(),
             source: MessageSource {
                 chat: chat.parse().expect("test chat JID"),
                 sender: sender.parse().expect("test sender JID"),
@@ -1181,7 +1204,7 @@ mod tests {
         // recipient=@bot>, `to` preserving the sender's device. Mirrors WA Web
         // DeliveryReceiptJob (SENDER + USER_JID(recipient)) and whatsmeow.
         let info = MessageInfo {
-            id: "FANOUT_BOT".to_string(),
+            id: "FANOUT_BOT".into(),
             source: MessageSource {
                 sender: "100000000000001:11@lid".parse().expect("sender"),
                 chat: "200000000000002@bot".parse().expect("chat"),
@@ -1216,7 +1239,7 @@ mod tests {
         // WA Web's `USER_JID` strips the device from `recipient`; a fanout to a
         // multi-device user echoes the non-AD recipient.
         let info = MessageInfo {
-            id: "FANOUT_DEV".to_string(),
+            id: "FANOUT_DEV".into(),
             source: MessageSource {
                 sender: "100000000000001:5@lid".parse().expect("sender"),
                 chat: "300000000000003@lid".parse().expect("chat"),
@@ -1241,7 +1264,7 @@ mod tests {
         // recipient) must keep `type="peer_msg"` and carry NO recipient (WA Web
         // `!l` guard), never `type="sender"`.
         let info = MessageInfo {
-            id: "PEER_FANOUT".to_string(),
+            id: "PEER_FANOUT".into(),
             source: MessageSource {
                 sender: "100000000000001@lid".parse().expect("sender"),
                 chat: "300000000000003@lid".parse().expect("chat"),
@@ -1269,7 +1292,7 @@ mod tests {
         // type=sender takes precedence over the inactive (passive companion)
         // branch: a self-fanout is always acknowledged as sender.
         let info = MessageInfo {
-            id: "FANOUT_INACTIVE".to_string(),
+            id: "FANOUT_INACTIVE".into(),
             source: MessageSource {
                 sender: "100000000000001@lid".parse().expect("sender"),
                 chat: "200000000000002@bot".parse().expect("chat"),
@@ -1352,7 +1375,7 @@ mod tests {
     #[test]
     fn delivery_receipt_for_lid_dm_preserves_device_in_to() {
         let info = MessageInfo {
-            id: "LID_DEV_RECEIPT".to_string(),
+            id: "LID_DEV_RECEIPT".into(),
             source: MessageSource {
                 // chat is the non-AD form (matches parse_message_info's
                 // chat = from.to_non_ad()).
@@ -1379,7 +1402,7 @@ mod tests {
     #[test]
     fn delivery_receipt_for_lid_dm_no_device_unchanged() {
         let info = MessageInfo {
-            id: "LID_NO_DEV".to_string(),
+            id: "LID_NO_DEV".into(),
             source: MessageSource {
                 chat: "185323896221943@lid".parse().expect("chat"),
                 sender: "185323896221943@lid".parse().expect("sender"),
@@ -1400,7 +1423,7 @@ mod tests {
     #[test]
     fn delivery_receipt_for_group_to_is_group_not_sender() {
         let info = MessageInfo {
-            id: "GRP_RECEIPT".to_string(),
+            id: "GRP_RECEIPT".into(),
             source: MessageSource {
                 chat: "120363021033254949@g.us".parse().expect("group"),
                 sender: "156535032389744:7@lid".parse().expect("sender"),
@@ -1425,7 +1448,7 @@ mod tests {
     #[test]
     fn delivery_receipt_for_peer_dm_to_preserves_device() {
         let mut info = MessageInfo {
-            id: "PEER_DEV".to_string(),
+            id: "PEER_DEV".into(),
             source: MessageSource {
                 chat: "9999999999@lid".parse().expect("chat"),
                 sender: "9999999999:3@lid".parse().expect("sender"),
@@ -1453,7 +1476,7 @@ mod tests {
     #[test]
     fn delivery_receipt_for_status_to_is_status_not_sender() {
         let info = MessageInfo {
-            id: "STATUS_RECEIPT".to_string(),
+            id: "STATUS_RECEIPT".into(),
             source: MessageSource {
                 chat: "status@broadcast".parse().expect("status"),
                 sender: "156535032389744:7@lid".parse().expect("sender"),
@@ -1873,7 +1896,7 @@ mod tests {
     #[test]
     fn should_send_delivery_receipt_skips_empty_id() {
         let mut info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
-        info.id = String::new();
+        info.id = Default::default();
         assert!(!Client::should_send_delivery_receipt(&info));
     }
 
@@ -1952,7 +1975,7 @@ mod tests {
         .await;
 
         let info = MessageInfo {
-            id: "TEST-ID-123".to_string(),
+            id: "TEST-ID-123".into(),
             source: MessageSource {
                 chat: "12345@s.whatsapp.net"
                     .parse()
@@ -1996,7 +2019,7 @@ mod tests {
         .await;
 
         let info = MessageInfo {
-            id: "GROUP-MSG-ID".to_string(),
+            id: "GROUP-MSG-ID".into(),
             source: MessageSource {
                 chat: "120363021033254949@g.us"
                     .parse()
@@ -2033,7 +2056,7 @@ mod tests {
         .await;
 
         let info = MessageInfo {
-            id: "OWN-MSG-ID".to_string(),
+            id: "OWN-MSG-ID".into(),
             source: MessageSource {
                 chat: "12345@s.whatsapp.net"
                     .parse()
@@ -2072,7 +2095,7 @@ mod tests {
         .await;
 
         let info = MessageInfo {
-            id: "".to_string(), // Empty ID
+            id: "".into(), // Empty ID
             source: MessageSource {
                 chat: "12345@s.whatsapp.net"
                     .parse()
@@ -2109,7 +2132,7 @@ mod tests {
         .await;
 
         let info = MessageInfo {
-            id: "STATUS-MSG-ID".to_string(),
+            id: "STATUS-MSG-ID".into(),
             source: MessageSource {
                 chat: "status@broadcast"
                     .parse()
@@ -2131,7 +2154,7 @@ mod tests {
     #[test]
     fn test_should_skip_delivery_receipt_for_newsletter() {
         let info = MessageInfo {
-            id: "NEWSLETTER-MSG-ID".to_string(),
+            id: "NEWSLETTER-MSG-ID".into(),
             source: MessageSource {
                 chat: "120363173003902460@newsletter"
                     .parse()
@@ -2157,7 +2180,7 @@ mod tests {
         // Self-synced messages (category="peer") should get delivery receipts
         // even though is_from_me is true.  WA Web sends type="peer_msg" for these.
         let info = MessageInfo {
-            id: "PEER-MSG-ID".to_string(),
+            id: "PEER-MSG-ID".into(),
             source: MessageSource {
                 chat: "155500012345@s.whatsapp.net"
                     .parse()
@@ -2714,7 +2737,7 @@ mod tests {
     fn test_should_skip_non_peer_self_messages() {
         // Normal self messages (no category) should still be skipped.
         let info = MessageInfo {
-            id: "SELF-MSG-ID".to_string(),
+            id: "SELF-MSG-ID".into(),
             source: MessageSource {
                 chat: "155500012345@s.whatsapp.net"
                     .parse()
@@ -3269,7 +3292,7 @@ mod tests {
 
     fn offline_info(id: &str, chat: &str, sender: &str, is_group: bool) -> Arc<MessageInfo> {
         let mut info = info_with(chat, sender, is_group);
-        info.id = id.to_string();
+        info.id = id.into();
         info.is_offline = true;
         Arc::new(info)
     }
@@ -3282,7 +3305,7 @@ mod tests {
             "5511999990000@s.whatsapp.net",
             false,
         );
-        peer.id = "M6".to_string();
+        peer.id = "M6".into();
         peer.source.is_from_me = true;
         peer.category = MessageCategory::Peer;
 
@@ -3379,11 +3402,8 @@ mod tests {
         // The shape must round-trip through our own ingest parser (the same
         // form WA Web sends us): list items first, stanza id appended last.
         let owned = node_to_arc(node.clone());
-        let parsed = wacore::stanza::receipt::collect_simple_message_ids(
-            owned.get(),
-            "M1".to_string(),
-            false,
-        );
+        let parsed =
+            wacore::stanza::receipt::collect_simple_message_ids(owned.get(), "M1".into(), false);
         assert_eq!(
             parsed,
             vec!["M2".to_string(), "M3".to_string(), "M1".to_string()]
@@ -3496,6 +3516,53 @@ mod tests {
         }
     }
 
+    /// `agent_docs/observability.md` makes reporting every retained collection
+    /// the rule, and this is the drain's largest transient after the commit
+    /// batch itself. Empty must read as zero, not as absent.
+    #[tokio::test]
+    async fn memory_report_accounts_for_the_offline_receipt_buffer() {
+        // Built like `offline_receipt_buffer_protocol`'s client, not through the
+        // test helper: a fresh client is in drain mode, which is what makes an
+        // offline message buffer instead of acking 1:1.
+        let pm = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager should initialize"),
+        );
+        let (client, _rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            client.memory_report().await.offline_receipt_buffer.entries,
+            0
+        );
+
+        let peer = "19045550180@s.whatsapp.net";
+        for id in ["OFFR1", "OFFR2", "OFFR3"] {
+            client.ack_received_message(&offline_info(id, peer, peer, false));
+        }
+
+        let reported = client.memory_report().await.offline_receipt_buffer;
+        assert_eq!(reported.entries, 3);
+        assert!(
+            reported.bytes >= 3 * size_of::<MessageInfo>() as u64,
+            "each buffered MessageInfo must be charged, got {} B",
+            reported.bytes,
+        );
+
+        client.clear_offline_receipt_buffer();
+        assert_eq!(
+            client.memory_report().await.offline_receipt_buffer.entries,
+            0
+        );
+    }
+
     #[tokio::test]
     async fn offline_receipt_buffer_protocol() {
         let backend = crate::test_utils::create_test_backend().await;
@@ -3539,7 +3606,7 @@ mod tests {
             "5511999990000@s.whatsapp.net",
             false,
         );
-        live.id = "LIVE1".to_string();
+        live.id = "LIVE1".into();
         client.ack_received_message(&Arc::new(live));
         assert_eq!(
             client.offline_receipt_buffer.lock().expect("buffer").len(),
@@ -3600,6 +3667,11 @@ mod tests {
         client
             .offline_sync_completed
             .store(false, std::sync::atomic::Ordering::Release);
+        assert!(
+            !client.try_buffer_offline_receipt(&late),
+            "a completed drain must not buffer while its completion event is still pending"
+        );
+        client.inbound_commit_batch.reset();
         let straggler = offline_info(
             "OFF4",
             "5511999990000@s.whatsapp.net",

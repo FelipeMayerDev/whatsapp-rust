@@ -11,7 +11,7 @@ use std::collections::hash_map::RandomState;
 use std::hash::Hash;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-util"))]
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::appstate::hash::HashState;
@@ -126,7 +126,9 @@ struct InMemoryState {
     lid_mappings: HashMap<String, LidPnMappingEntry>,
     /// Reverse index: phone_number -> lid
     pn_to_lid: HashMap<String, String>,
-    base_keys: HashMap<BaseKeyKey, Vec<u8>>,
+    /// `(base_key, created_at)`; the timestamp is what the retention sweep
+    /// prunes on, mirroring the SQLite column.
+    base_keys: HashMap<BaseKeyKey, (Vec<u8>, i64)>,
     /// Keyed by `Arc<str>`, shared with each record's own `user`.
     device_lists: HashMap<Arc<str>, DeviceListRecord>,
     group_metadata: HashMap<String, Vec<u8>>,
@@ -195,6 +197,10 @@ pub struct InMemoryBackend {
     /// ratchet advance cannot be persisted.
     #[cfg(any(test, feature = "test-util"))]
     fail_session_writes: AtomicBool,
+    /// If set, write this many session rows then fail the batch. Test hook for
+    /// retrying a backend that reports an error after partial progress.
+    #[cfg(any(test, feature = "test-util"))]
+    fail_session_after: AtomicUsize,
     /// When set, `put_sender_keys_batch` fails. Test hook: the sender-key
     /// counterpart of `fail_session_writes` (wire gate must survive a failed
     /// flush).
@@ -220,6 +226,8 @@ impl InMemoryBackend {
             #[cfg(any(test, feature = "test-util"))]
             fail_session_writes: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-util"))]
+            fail_session_after: AtomicUsize::new(usize::MAX),
+            #[cfg(any(test, feature = "test-util"))]
             fail_sender_key_writes: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-util"))]
             signed_prekey_read_gate: std::sync::Mutex::new(None),
@@ -244,6 +252,14 @@ impl InMemoryBackend {
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_fail_session_writes(&self, fail: bool) {
         self.fail_session_writes.store(fail, Ordering::Relaxed);
+    }
+
+    /// Write `prefix` rows from the next session batch, then return an error.
+    /// Pass `None` to disable the partial-progress fault.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_fail_session_after_prefix(&self, prefix: Option<usize>) {
+        self.fail_session_after
+            .store(prefix.unwrap_or(usize::MAX), Ordering::Relaxed);
     }
 
     /// Make every subsequent `put_sender_keys_batch` fail (or stop failing).
@@ -310,6 +326,19 @@ impl SignalStore for InMemoryBackend {
         Ok(self.state.lock().await.sessions.get(address).cloned())
     }
 
+    /// One lock acquisition for the whole fan-out instead of one per device.
+    /// Returns only the addresses that exist, like the default.
+    async fn get_sessions_batch(&self, addresses: &[Arc<str>]) -> Result<Vec<(Arc<str>, Bytes)>> {
+        let state = self.state.lock().await;
+        let mut result = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            if let Some(session) = state.sessions.get(address.as_ref()) {
+                result.push((address.clone(), session.clone()));
+            }
+        }
+        Ok(result)
+    }
+
     async fn put_session(&self, address: &str, session: &[u8]) -> Result<()> {
         self.state
             .lock()
@@ -331,12 +360,21 @@ impl SignalStore for InMemoryBackend {
         }
         let mut state = self.state.lock().await;
         state.sessions.reserve(sessions.len());
-        for (address, session) in sessions {
+        for (index, (address, session)) in sessions.iter().enumerate() {
+            #[cfg(any(test, feature = "test-util"))]
+            {
+                if index >= self.fail_session_after.load(Ordering::Relaxed) {
+                    return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                        "put_sessions_batch failed after partial progress (test hook)",
+                    )));
+                }
+            }
             if let Some(stored) = state.sessions.get_mut(address.as_ref()) {
                 *stored = session.clone();
             } else {
                 state.sessions.insert(address.to_string(), session.clone());
             }
+            let _ = index;
         }
         Ok(())
     }
@@ -737,7 +775,7 @@ impl ProtocolStore for InMemoryBackend {
     async fn save_base_key(&self, address: &str, message_id: &str, base_key: &[u8]) -> Result<()> {
         self.state.lock().await.base_keys.insert(
             (address.to_string(), message_id.to_string()),
-            base_key.to_vec(),
+            (base_key.to_vec(), crate::time::now_secs()),
         );
         Ok(())
     }
@@ -752,7 +790,7 @@ impl ProtocolStore for InMemoryBackend {
         let same = s
             .base_keys
             .get(&(address.to_string(), message_id.to_string()))
-            .is_some_and(|stored| stored == current_base_key);
+            .is_some_and(|(stored, _)| stored == current_base_key);
         Ok(same)
     }
 
@@ -763,6 +801,14 @@ impl ProtocolStore for InMemoryBackend {
             .base_keys
             .remove(&(address.to_string(), message_id.to_string()));
         Ok(())
+    }
+
+    async fn delete_expired_base_keys(&self, cutoff_timestamp: i64) -> Result<u32> {
+        let mut s = self.state.lock().await;
+        let before = s.base_keys.len();
+        s.base_keys
+            .retain(|_, (_, created_at)| *created_at >= cutoff_timestamp);
+        Ok((before - s.base_keys.len()) as u32)
     }
 
     // --- Device Registry ---
@@ -778,6 +824,14 @@ impl ProtocolStore for InMemoryBackend {
 
     async fn get_devices(&self, user: &str) -> Result<Option<DeviceListRecord>> {
         Ok(self.state.lock().await.device_lists.get(user).cloned())
+    }
+
+    async fn get_devices_batch(&self, users: &[&str]) -> Result<Vec<DeviceListRecord>> {
+        let state = self.state.lock().await;
+        Ok(users
+            .iter()
+            .filter_map(|user| state.device_lists.get(*user).cloned())
+            .collect())
     }
 
     async fn delete_devices(&self, user: &str) -> Result<()> {
@@ -969,6 +1023,16 @@ impl ProtocolStore for InMemoryBackend {
             },
         );
         Ok(())
+    }
+
+    async fn get_sent_message(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .sent_messages
+            .get(&(chat_jid.to_string(), message_id.to_string()))
+            .map(|e| e.payload.clone()))
     }
 
     async fn take_sent_message(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
@@ -1259,11 +1323,11 @@ impl DeviceStore for InMemoryBackend {
         });
         account!(state.pn_to_lid, |k: &String, v: &String| k.capacity()
             + v.capacity());
-        account!(state.base_keys, |k: &BaseKeyKey, v: &Vec<u8>| k
+        account!(state.base_keys, |k: &BaseKeyKey, v: &(Vec<u8>, i64)| k
             .0
             .capacity()
             + k.1.capacity()
-            + v.capacity());
+            + v.0.capacity());
         // The key and the record's `user` are one allocation, counted once.
         account!(state.device_lists, |_k: &Arc<str>, v: &DeviceListRecord| {
             v.user.len()
@@ -1492,6 +1556,40 @@ mod tests {
     #[test]
     fn in_memory_backend_implements_backend() {
         is_backend::<InMemoryBackend>();
+    }
+
+    /// The batch read returns only what exists, keyed as requested: a send's
+    /// prefetch tells hits from misses by set difference.
+    #[tokio::test]
+    async fn get_sessions_batch_returns_only_hits() {
+        let backend = InMemoryBackend::new();
+        let first: Arc<str> = "15550000001:1@s.whatsapp.net".into();
+        let second: Arc<str> = "15550000002:2@s.whatsapp.net".into();
+        let missing: Arc<str> = "15550000003:3@s.whatsapp.net".into();
+        backend
+            .put_sessions_batch(&[
+                (first.clone(), Bytes::from_static(b"first")),
+                (second.clone(), Bytes::from_static(b"second")),
+            ])
+            .await
+            .unwrap();
+
+        let loaded = backend
+            .get_sessions_batch(&[first.clone(), missing.clone(), second.clone()])
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 2, "misses are omitted, not returned empty");
+        assert_eq!(loaded[0], (first, Bytes::from_static(b"first")));
+        assert_eq!(loaded[1], (second, Bytes::from_static(b"second")));
+
+        assert!(
+            backend
+                .get_sessions_batch(&[missing])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(backend.get_sessions_batch(&[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1737,6 +1835,56 @@ mod tests {
             .await
             .unwrap();
         assert!(dev.has_signal_state_for_user(user).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn get_sent_message_preserves_payload_and_expiry() {
+        let backend = InMemoryBackend::new();
+        let chat = "120363000000000001@g.us";
+        backend
+            .store_sent_message(chat, "READ", b"payload")
+            .await
+            .unwrap();
+        backend
+            .state
+            .lock()
+            .await
+            .sent_messages
+            .get_mut(&(chat.into(), "READ".into()))
+            .unwrap()
+            .timestamp = 1;
+        for _ in 0..2 {
+            assert_eq!(
+                backend
+                    .get_sent_message(chat, "READ")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(b"payload".as_slice())
+            );
+        }
+        assert!(
+            backend
+                .get_sent_message(chat, "MISSING")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_sent_message("120363000000000002@g.us", "READ")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(backend.delete_expired_sent_messages(2).await.unwrap(), 1);
+        assert!(
+            backend
+                .get_sent_message(chat, "READ")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

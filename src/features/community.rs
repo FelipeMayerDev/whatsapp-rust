@@ -16,10 +16,14 @@ use log::warn;
 use thiserror::Error;
 use wacore::iq::groups::{
     CommunityParticipatingIq, DeleteCommunityIq, GetLinkedGroupsParticipantsIq, GroupCreateOptions,
-    JoinLinkedGroupIq, LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
+    JoinGroupResult, JoinLinkedGroupIq, LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
 };
 use wacore::iq::mex_operations::{fetch_all_subgroups, query_subgroup_participant_count};
 use wacore_binary::Jid;
+
+/// How the subgroup queries say the request came from a user acting now, which
+/// is the only context WA Web sends from the web client.
+const SUBGROUP_QUERY_CONTEXT: &str = "INTERACTIVE";
 
 /// Error returned by community operations.
 #[derive(Debug, Error)]
@@ -37,6 +41,10 @@ pub enum CommunityError {
     /// The request was malformed or the server response was missing required data.
     #[error("invalid community request: {0}")]
     InvalidRequest(String),
+    /// The subgroup join was received but requires membership approval: the
+    /// caller is not in the group yet.
+    #[error("subgroup join requires membership approval: {0}")]
+    MembershipApprovalRequired(Jid),
 }
 
 // Types
@@ -303,7 +311,11 @@ impl<'a> Community<'a> {
             .mex()
             .query(mex_request!(fetch_all_subgroups {
                 group_id: Some(community_jid.to_string()),
-                ..Default::default()
+                query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),
+                // WA Web names a subgroup the user has already joined here, to
+                // steer which subgroups come back first. There is no such hint
+                // to give from this API, and WA Web omits it in that case too.
+                sub_group_hint_id: None,
             }))
             .await?;
 
@@ -370,7 +382,8 @@ impl<'a> Community<'a> {
             .query(mex_request!(query_subgroup_participant_count {
                 input: Some(query_subgroup_participant_count::Input {
                     group_jid: Some(community_jid.to_string()),
-                    ..Default::default()
+                    query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),
+                    sub_group_jid_hint: None,
                 }),
             }))
             .await?;
@@ -425,6 +438,11 @@ impl<'a> Community<'a> {
     }
 
     /// Join a linked subgroup via the parent community.
+    ///
+    /// The join RPC itself carries no metadata (WA Web's success variants hold
+    /// no fields), so a joined result is followed by a metadata query. An
+    /// approval-pending join is reported rather than resolved: the caller is
+    /// not in the group, so there is no metadata to return.
     pub async fn join_subgroup(
         &self,
         community_jid: impl Into<Jid>,
@@ -432,11 +450,18 @@ impl<'a> Community<'a> {
     ) -> Result<GroupMetadata, CommunityError> {
         let community_jid = &community_jid.into();
         let subgroup_jid = &subgroup_jid.into();
-        let response = self
+        match self
             .client
             .execute(JoinLinkedGroupIq::new(community_jid, subgroup_jid))
-            .await?;
-        Ok(GroupMetadata::from(response))
+            .await?
+        {
+            JoinGroupResult::Joined(_) => {
+                self.query_linked_group(community_jid, subgroup_jid).await
+            }
+            JoinGroupResult::PendingApproval(jid) => {
+                Err(CommunityError::MembershipApprovalRequired(jid))
+            }
+        }
     }
 
     /// Get all participants across all linked groups of a community.
@@ -539,6 +564,63 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn community_jid() -> Jid {
+        "120363000000000001@g.us"
+            .parse()
+            .expect("fictitious community")
+    }
+
+    /// Regression for the same 400 as the newsletter queries: WhatsApp Web
+    /// always sends `query_context`, and only leaves `sub_group_hint_id` out
+    /// when it has no joined subgroup to name, which is this client's case.
+    #[test]
+    fn subgroup_listing_sends_the_query_context_and_omits_only_the_hint() {
+        let request = mex_request!(fetch_all_subgroups {
+            group_id: Some(community_jid().to_string()),
+            query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),
+            sub_group_hint_id: None,
+        });
+
+        assert_eq!(
+            request.missing_variables().expect("serialize"),
+            vec!["sub_group_hint_id"]
+        );
+        assert_eq!(
+            serde_json::to_value(&request.variables).expect("serialize"),
+            serde_json::json!({
+                "group_id": "120363000000000001@g.us",
+                "query_context": "INTERACTIVE",
+            })
+        );
+    }
+
+    /// The participant count carries the same context, one level down inside
+    /// `input`, where the compiler cannot force the decision.
+    #[test]
+    fn participant_count_input_carries_the_query_context() {
+        let request = mex_request!(query_subgroup_participant_count {
+            input: Some(query_subgroup_participant_count::Input {
+                group_jid: Some(community_jid().to_string()),
+                query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),
+                sub_group_jid_hint: None,
+            }),
+        });
+
+        assert_eq!(
+            request.missing_variables().expect("serialize"),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            serde_json::to_value(&request.variables).expect("serialize"),
+            serde_json::json!({
+                "input": {
+                    "group_jid": "120363000000000001@g.us",
+                    "query_context": "INTERACTIVE",
+                }
+            })
+        );
+    }
 
     #[test]
     fn subgroup_parser_preserves_typed_metadata() {

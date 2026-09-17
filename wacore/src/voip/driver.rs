@@ -16,7 +16,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::{Fuse, FusedFuture};
-use portable_atomic::{AtomicBool, AtomicUsize, Ordering};
+use portable_atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use zeroize::Zeroize;
 
 use crate::runtime::{BoxFuture, Runtime};
@@ -24,7 +24,7 @@ use crate::time::Instant;
 use crate::types::group_call::{GROUP_CALL_MAX_PARTICIPANTS, GroupCallUpdate};
 use crate::voip::audio::EncodedAudioFrame;
 use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
-use crate::voip::engine::{self, CallEngine, CallEvent, Input, Output};
+use crate::voip::engine::{self, CallEngine, CallEvent, Input, KeyframeUrgency, Output};
 use crate::voip::group_media::GroupMediaError;
 use crate::voip::h264::VideoFrame;
 use crate::voip::registry::force_send_call_event;
@@ -138,6 +138,8 @@ impl Drop for GroupRawEpoch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum VideoControl {
+    /// Select the source generation accepted by the timestamped input queue.
+    SetInputGeneration(u64),
     /// RTP clock increment for each access unit. Sent before attaching a source whose cadence is
     /// different from the 15 fps compatibility default.
     SetTimestampStride(u32),
@@ -149,8 +151,16 @@ pub enum VideoControl {
     EnableAwaitingAccept,
     /// Tear the video plane down (downgrade to audio).
     Disable,
+    /// Gate outbound video off the wire while inbound keeps decoding (our camera stopped; the
+    /// peer is still sending). `Enable` later ungates it, like an accepted upgrade.
+    DisableOutbound,
+    /// Tear the video plane down while retaining queued legacy AUs for a legacy reattach.
+    DisableKeepLegacy,
     /// Require the next outbound access unit to be an IDR frame after changing its source role.
     RequireKeyframe,
+    /// Ask the PEER for a keyframe, by RTCP PLI: the mirror of `RequireKeyframe`. See
+    /// [`CallEngine::request_peer_keyframe`], which decides what becomes of one.
+    RequestPeerKeyframe(KeyframeUrgency),
     /// The peer's device orientation (0..3, ×90°) from a `<video>` stanza.
     SetOrientation(u8),
     /// One routed group participant's device orientation.
@@ -165,6 +175,26 @@ pub enum VideoControl {
 enum VideoControlMessage {
     State(VideoControl),
     ParticipantOrientationsReady,
+    /// A peer-keyframe request is pending; the urgency travels beside it. Every other state
+    /// change here is a discrete consumer action, so an unbounded queue costs nothing -- but a
+    /// sink is invited to ask on every dropped access unit, which is a run this queue would
+    /// otherwise grow to hold while the drive loop is busy. The engine's throttle only runs
+    /// after the dequeue, and so cannot bound what waits ahead of it.
+    PeerKeyframeRequested,
+}
+
+/// [`PendingPeerKeyframe`] slots, ordered so `fetch_max` raises urgency and never lowers it: a
+/// decoder that failed after asking politely still needs the throttle bypassed, and the request
+/// it is joining was queued at the lower one.
+const PEER_KEYFRAME_NONE: u8 = 0;
+const PEER_KEYFRAME_COALESCED: u8 = 1;
+const PEER_KEYFRAME_IMMEDIATE: u8 = 2;
+
+fn peer_keyframe_slot(urgency: KeyframeUrgency) -> u8 {
+    match urgency {
+        KeyframeUrgency::Coalesced => PEER_KEYFRAME_COALESCED,
+        KeyframeUrgency::Immediate => PEER_KEYFRAME_IMMEDIATE,
+    }
 }
 
 #[derive(Default)]
@@ -182,6 +212,7 @@ pub struct VideoControlSender {
     state: async_channel::Sender<VideoControlMessage>,
     orientation: async_channel::Sender<u8>,
     participant_orientations: Arc<PendingParticipantOrientations>,
+    peer_keyframe: Arc<AtomicU8>,
 }
 
 /// Receiving half of [`video_control_channel`].
@@ -189,6 +220,7 @@ pub struct VideoControlReceiver {
     state: async_channel::Receiver<VideoControlMessage>,
     orientation: async_channel::Receiver<u8>,
     participant_orientations: Arc<PendingParticipantOrientations>,
+    peer_keyframe: Arc<AtomicU8>,
     ready_participant_orientations: Mutex<VecDeque<(wacore_binary::Jid, u8)>>,
     /// `ready_participant_orientations.len()`, same role as [`PendingParticipantOrientations::len`].
     ready_participant_orientations_len: AtomicUsize,
@@ -199,16 +231,19 @@ pub fn video_control_channel() -> (VideoControlSender, VideoControlReceiver) {
     let (state_tx, state_rx) = async_channel::unbounded();
     let (orientation_tx, orientation_rx) = async_channel::bounded(1);
     let participant_orientations = Arc::new(PendingParticipantOrientations::default());
+    let peer_keyframe = Arc::new(AtomicU8::new(PEER_KEYFRAME_NONE));
     (
         VideoControlSender {
             state: state_tx,
             orientation: orientation_tx,
             participant_orientations: participant_orientations.clone(),
+            peer_keyframe: peer_keyframe.clone(),
         },
         VideoControlReceiver {
             state: state_rx,
             orientation: orientation_rx,
             participant_orientations,
+            peer_keyframe,
             ready_participant_orientations: Mutex::new(VecDeque::new()),
             ready_participant_orientations_len: AtomicUsize::new(0),
         },
@@ -272,6 +307,29 @@ impl VideoControlSender {
                     false
                 }
             }
+            VideoControl::RequestPeerKeyframe(urgency) => {
+                let previous = self
+                    .peer_keyframe
+                    .fetch_max(peer_keyframe_slot(urgency), Ordering::Relaxed);
+                // Not once the receiver is gone: the marker that would carry this
+                // raise can no longer be consumed, so the slot would stay set and
+                // every later send would report a queued request that does not
+                // exist. Falling through clears it on the failed send instead.
+                if previous != PEER_KEYFRAME_NONE && !self.state.is_closed() {
+                    return true;
+                }
+                if self
+                    .state
+                    .try_send(VideoControlMessage::PeerKeyframeRequested)
+                    .is_ok()
+                {
+                    true
+                } else {
+                    self.peer_keyframe
+                        .store(PEER_KEYFRAME_NONE, Ordering::Relaxed);
+                    false
+                }
+            }
             state => self
                 .state
                 .try_send(VideoControlMessage::State(state))
@@ -319,6 +377,21 @@ impl VideoControlReceiver {
     /// Whether both halves have lost every sender.
     pub fn is_closed(&self) -> bool {
         self.state.is_closed() && self.orientation.is_closed()
+    }
+
+    fn take_peer_keyframe_request(&self) -> Option<VideoControl> {
+        match self
+            .peer_keyframe
+            .swap(PEER_KEYFRAME_NONE, Ordering::Relaxed)
+        {
+            PEER_KEYFRAME_NONE => None,
+            PEER_KEYFRAME_IMMEDIATE => Some(VideoControl::RequestPeerKeyframe(
+                KeyframeUrgency::Immediate,
+            )),
+            _ => Some(VideoControl::RequestPeerKeyframe(
+                KeyframeUrgency::Coalesced,
+            )),
+        }
     }
 
     fn take_participant_orientation(&self) -> Option<VideoControl> {
@@ -373,6 +446,11 @@ impl VideoControlReceiver {
                         return Ok(orientation);
                     }
                 }
+                Ok(VideoControlMessage::PeerKeyframeRequested) => {
+                    if let Some(request) = self.take_peer_keyframe_request() {
+                        return Ok(request);
+                    }
+                }
                 Err(error) => break error,
             }
         };
@@ -397,6 +475,11 @@ impl VideoControlReceiver {
                 VideoControlMessage::ParticipantOrientationsReady => {
                     if let Some(orientation) = self.take_participant_orientation() {
                         return Ok(orientation);
+                    }
+                }
+                VideoControlMessage::PeerKeyframeRequested => {
+                    if let Some(request) = self.take_peer_keyframe_request() {
+                        return Ok(request);
                     }
                 }
             }
@@ -434,6 +517,11 @@ impl VideoControlReceiver {
                                     return Ok(orientation);
                                 }
                             }
+                            Ok(VideoControlMessage::PeerKeyframeRequested) => {
+                                if let Some(request) = self.take_peer_keyframe_request() {
+                                    return Ok(request);
+                                }
+                            }
                             Err(_) => continue,
                         },
                         orientation = orientation => match orientation {
@@ -461,6 +549,9 @@ pub struct CallChannels {
     pub rekey: Option<async_channel::Receiver<PeerAnswer>>,
     /// Outbound video: one pre-encoded H.264 Annex-B access unit per item.
     pub video_in: async_channel::Receiver<Vec<u8>>,
+    /// Optional capture-timestamped video input. The legacy `video_in` channel remains available
+    /// for sources whose only contract is a fixed cadence.
+    pub timed_video_in: Option<async_channel::Receiver<VideoInput>>,
     /// Inbound video: reassembled peer access units (dropped on sink overflow, like the speaker).
     pub video_out: async_channel::Sender<VideoFrame>,
     /// Mid-call video-plane control (lossless state, coalesced orientation).
@@ -469,6 +560,17 @@ pub struct CallChannels {
     pub group_ctl: Option<async_channel::Receiver<GroupControl>>,
     /// Where the drive loop publishes media counters for `CallHandle::media_stats`.
     pub media_stats: Arc<crate::voip::media_stats::MediaStatsCell>,
+}
+
+/// A pre-encoded video access unit with an RTP-clock capture timestamp.
+#[derive(Debug, Clone)]
+pub struct VideoInput {
+    /// Complete Annex-B H.264 access unit.
+    pub data: Vec<u8>,
+    /// Capture timestamp in the 90 kHz RTP clock, compared modulo `u32`.
+    pub timestamp: u32,
+    /// Source generation assigned by the facade. Stale generations are discarded at the driver.
+    pub generation: u64,
 }
 
 /// What the caller learned from the callee's `<accept>`, as one message.
@@ -527,7 +629,7 @@ impl SendBatch {
             .first()
             .and_then(|packet| parse_rtp_header(packet))
             .and_then(|header| header.video_extension)
-            .is_some_and(|extension| extension.media_frame_info == VIDEO_MEDIA_FRAME_INFO_IDR);
+            .is_some_and(|extension| extension.media_frame_info & VIDEO_MEDIA_FRAME_INFO_IDR != 0);
         Self {
             bytes: packets.iter().map(Bytes::len).sum(),
             packets: packets.into(),
@@ -1080,6 +1182,8 @@ async fn run_call_with_clock_and_wallclock(
     // Same closed-channel guards for the video arms: a call that never wires a video source/control
     // sender must not busy-spin on their always-ready `Err`.
     let mut video_in_open = true;
+    let mut timed_video_in_open = true;
+    let mut video_generation = 0u64;
     let mut video_ctl_open = true;
     // Set by a `Disable` to drain the video input queue after the select block (it can't be drained
     // inside, where the arm futures borrow the channel).
@@ -1122,6 +1226,7 @@ async fn run_call_with_clock_and_wallclock(
         let mut pending_video = Vec::new();
         let mut reconnect_to = None;
         let mut sink_dropped = 0u32;
+        let mut video_sink_dropped = 0u32;
         loop {
             match eng.poll_output() {
                 // Queue for the in-flight send arm; never await the write in this loop.
@@ -1153,8 +1258,17 @@ async fn run_call_with_clock_and_wallclock(
                     }
                 }
                 // Same policy for video: a stalled sink sheds frames, never the drive loop.
+                // A shed access unit leaves every later one referencing a picture
+                // the consumer never got, so it is worth a request -- but only
+                // `Full` is a shed. `Closed` means nobody is decoding at all, and
+                // asking once an interval for the rest of the call would buy the
+                // peer nothing but its largest frame.
                 Output::VideoPlayout(frame) => {
-                    let _ = channels.video_out.try_send(frame);
+                    if let Err(async_channel::TrySendError::Full(_)) =
+                        channels.video_out.try_send(frame)
+                    {
+                        video_sink_dropped = video_sink_dropped.saturating_add(1);
+                    }
                 }
                 Output::Event(ev) => {
                     let keyframe_request = matches!(ev, CallEvent::VideoKeyframeNeeded);
@@ -1200,6 +1314,13 @@ async fn run_call_with_clock_and_wallclock(
         // that is already behind anything per packet.
         if sink_dropped != 0 {
             eng.note_audio_sink_dropped(sink_dropped);
+        }
+        // After the drain, so the request joins an outbox this loop is no longer
+        // walking. Coalesced: a stalled sink sheds a run of units describing one
+        // stall, and the engine's throttle turns that run into one request.
+        if video_sink_dropped != 0 {
+            eng.note_video_sink_dropped(video_sink_dropped);
+            eng.request_peer_keyframe(now_ms(), KeyframeUrgency::Coalesced);
         }
 
         // Only where there is a picture to unblock: a relay reconnect raises the
@@ -1354,6 +1475,21 @@ async fn run_call_with_clock_and_wallclock(
         }
         .fuse();
         futures::pin_mut!(video_in_fut);
+
+        let timed_video_in = channels.timed_video_in.as_ref();
+        let timed_video_in_live = timed_video_in_open && timed_video_in.is_some();
+        let timed_video_in_fut = async move {
+            if timed_video_in_live {
+                timed_video_in
+                    .expect("timed_video_in_open implies Some")
+                    .recv()
+                    .await
+            } else {
+                std::future::pending().await
+            }
+        }
+        .fuse();
+        futures::pin_mut!(timed_video_in_fut);
 
         let video_ctl = &channels.video_ctl;
         let video_ctl_fut = async move {
@@ -1532,6 +1668,9 @@ async fn run_call_with_clock_and_wallclock(
             // Enable can admit frames from the replacement source.
             ctl = video_ctl_fut => {
                 match ctl {
+                    Ok(VideoControl::SetInputGeneration(generation)) => {
+                        video_generation = generation;
+                    }
                     Ok(VideoControl::SetTimestampStride(ts_stride)) => {
                         let _ = eng.set_video_timestamp_stride(ts_stride);
                     }
@@ -1555,13 +1694,44 @@ async fn run_call_with_clock_and_wallclock(
                                 packets: dropped.packets,
                             });
                         }
-                        // Discard any AUs still queued from the (now-detached) source, so a quick
-                        // re-Enable can't transmit stale frames from the previous session under the
-                        // new negotiation. Drained after the select block (the futures borrow the
-                        // channel).
                         drain_video_in = true;
                     }
+                    Ok(VideoControl::DisableOutbound) => {
+                        eng.gate_video_outbound();
+                        let dropped = purge_unstarted_video(
+                            &mut send_queue,
+                            &mut awaiting_video_keyframe,
+                        );
+                        if dropped.packets != 0 {
+                            let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
+                                video_access_units: dropped.video_access_units,
+                                packets: dropped.packets,
+                            });
+                        }
+                        drain_video_in = true;
+                    }
+                    Ok(VideoControl::DisableKeepLegacy) => {
+                        eng.disable_video();
+                        let dropped = purge_unstarted_video(
+                            &mut send_queue,
+                            &mut awaiting_video_keyframe,
+                        );
+                        if dropped.packets != 0 {
+                            let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
+                                video_access_units: dropped.video_access_units,
+                                packets: dropped.packets,
+                            });
+                        }
+                        // Keep queued legacy AUs: this control is used only while replacing one
+                        // legacy source with another, and the replacement shares this queue. The
+                        // legacy API never carried source generations, so an old tail may precede
+                        // the replacement's first AU exactly as it did before timestamped input.
+                        drain_video_in = false;
+                    }
                     Ok(VideoControl::RequireKeyframe) => eng.require_video_keyframe(),
+                    Ok(VideoControl::RequestPeerKeyframe(urgency)) => {
+                        eng.request_peer_keyframe(now_ms(), urgency);
+                    }
                     Ok(VideoControl::SetOrientation(o)) => eng.set_peer_video_orientation(o),
                     Ok(VideoControl::SetParticipantOrientation {
                         participant,
@@ -1650,6 +1820,21 @@ async fn run_call_with_clock_and_wallclock(
                 // Video source gone (encoder EOF / downgrade released it): disable the arm but keep
                 // the call alive, exactly like the mic.
                 Err(_) => video_in_open = false,
+            },
+            timed = timed_video_in_fut => match timed {
+                Ok(frame) => {
+                    if frame.generation == video_generation {
+                        eng.handle_video_frame_at(now_ms(), &frame.data, frame.timestamp);
+                    }
+                    let now = now_ms();
+                    if let Some(at) = eng.poll_timeout()
+                        && at != engine::NEVER
+                        && now >= at
+                    {
+                        eng.handle_input(now, Input::Timeout);
+                    }
+                }
+                Err(_) => timed_video_in_open = false,
             },
             _ = &mut timer => eng.handle_input(now_ms(), Input::Timeout),
         }
@@ -1851,6 +2036,61 @@ mod tests {
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("replacement already consumed"))
         }
+    }
+
+    /// What the engine's throttle cannot do: it runs after the dequeue, so a burst queued while
+    /// the drive loop is busy would sit in the mailbox whole before the first one reached it.
+    #[test]
+    fn video_control_channel_coalesces_peer_keyframe_requests() {
+        let (tx, rx) = video_control_channel();
+
+        for _ in 0..64 {
+            assert!(tx.send(VideoControl::RequestPeerKeyframe(
+                KeyframeUrgency::Coalesced
+            )));
+        }
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(VideoControl::RequestPeerKeyframe(
+                KeyframeUrgency::Coalesced
+            ))
+        ));
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    /// Coalescing must not answer the decoder that failed with the routine request it joined --
+    /// nor the reverse, where a later routine ask would spend an already-queued bypass.
+    #[test]
+    fn a_pending_peer_keyframe_request_takes_the_higher_urgency() {
+        let (tx, rx) = video_control_channel();
+
+        assert!(tx.send(VideoControl::RequestPeerKeyframe(
+            KeyframeUrgency::Coalesced
+        )));
+        assert!(tx.send(VideoControl::RequestPeerKeyframe(
+            KeyframeUrgency::Immediate
+        )));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(VideoControl::RequestPeerKeyframe(
+                KeyframeUrgency::Immediate
+            ))
+        ));
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+
+        assert!(tx.send(VideoControl::RequestPeerKeyframe(
+            KeyframeUrgency::Immediate
+        )));
+        assert!(tx.send(VideoControl::RequestPeerKeyframe(
+            KeyframeUrgency::Coalesced
+        )));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(VideoControl::RequestPeerKeyframe(
+                KeyframeUrgency::Immediate
+            ))
+        ));
     }
 
     #[test]
@@ -2235,6 +2475,7 @@ mod tests {
             events,
             rekey: None,
             video_in: vin_rx,
+            timed_video_in: None,
             video_out: vout_tx,
             video_ctl: vctl_rx,
             group_ctl: None,
@@ -3307,16 +3548,42 @@ mod tests {
         let (spk_tx, _spk_rx) = async_channel::unbounded();
         let (ev_tx, _ev_rx) = async_channel::unbounded();
         let (vin_tx, vin_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (timed_tx, timed_rx) = async_channel::unbounded::<VideoInput>();
         let (vout_tx, vout_rx) = async_channel::unbounded::<VideoFrame>();
         let (vctl_tx, vctl_rx) = video_control_channel();
 
         // Control drains first (bias), so cadence, Enable, and orientation land before any AU.
+        assert!(vctl_tx.send(VideoControl::DisableKeepLegacy));
+        assert!(vctl_tx.send(VideoControl::SetInputGeneration(7)));
         assert!(vctl_tx.send(VideoControl::SetTimestampStride(4500)));
         assert!(vctl_tx.send(VideoControl::Enable));
         assert!(vctl_tx.send(VideoControl::SetOrientation(1)));
         let our_au = make_au(3000);
         vin_tx.try_send(our_au.clone()).unwrap();
-        vin_tx.try_send(our_au).unwrap();
+        vin_tx.try_send(our_au.clone()).unwrap();
+        timed_tx
+            .try_send(VideoInput {
+                data: our_au.clone(),
+                timestamp: 9000,
+                generation: 7,
+            })
+            .unwrap();
+        timed_tx
+            .try_send(VideoInput {
+                data: our_au.clone(),
+                timestamp: 18000,
+                generation: 7,
+            })
+            .unwrap();
+        for _ in 0..64 {
+            timed_tx
+                .try_send(VideoInput {
+                    data: our_au.clone(),
+                    timestamp: 9000,
+                    generation: 6,
+                })
+                .unwrap();
+        }
 
         let eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         futures::executor::block_on(run_call(
@@ -3331,6 +3598,7 @@ mod tests {
                 events: ev_tx,
                 rekey: None,
                 video_in: vin_rx,
+                timed_video_in: Some(timed_rx),
                 video_out: vout_tx,
                 video_ctl: vctl_rx,
                 group_ctl: None,
@@ -3339,17 +3607,19 @@ mod tests {
             eng,
         ));
 
-        // Inbound: the peer AU reassembled to the sink, orientation stamped from the control arm.
+        // RTP frame metadata takes precedence over the signaling fallback.
         let frames: Vec<VideoFrame> = std::iter::from_fn(|| vout_rx.try_recv().ok()).collect();
         assert_eq!(frames.len(), 1, "peer AU must reach video_out exactly once");
         assert_eq!(frames[0].data, peer_au);
         assert!(frames[0].keyframe);
         assert_eq!(
-            frames[0].orientation, 1,
-            "SetOrientation must apply before the inbound AU reassembles"
+            frames[0].orientation, 0,
+            "the upright frame must not inherit the device orientation"
         );
 
-        // Outbound: each 3KB AU fans out to four PT-97 packets and the 20 fps stride applies.
+        // Outbound: the two legacy AUs retain fixed-stride timestamps, while the two current timed AUs
+        // preserve their capture gap. The stale generation is ignored even though it was queued before
+        // the driver processed the replacement controls.
         let sent = transport.sent.lock().unwrap();
         let video_headers = sent
             .iter()
@@ -3357,15 +3627,14 @@ mod tests {
                 parse_rtp_header(packet).filter(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264)
             })
             .collect::<Vec<_>>();
-        assert_eq!(video_headers.len(), 8);
-        assert_eq!(
-            video_headers
-                .iter()
-                .filter(|header| header.marker)
-                .map(|header| header.timestamp)
-                .collect::<Vec<_>>(),
-            [0, 4500]
-        );
+        assert_eq!(video_headers.len(), 16);
+        let mut marker_timestamps = video_headers
+            .iter()
+            .filter(|header| header.marker)
+            .map(|header| header.timestamp)
+            .collect::<Vec<_>>();
+        marker_timestamps.sort_unstable();
+        assert_eq!(marker_timestamps, [0, 4500, 9000, 18000]);
     }
 
     // A relay stall backs the queue up past cap: the overflow policy must shed media, never the STUN
@@ -3447,6 +3716,64 @@ mod tests {
         assert_eq!(sent, (0..40u16).collect::<Vec<_>>());
     }
 
+    /// The STAP-A-first keyframe shape the packetizer now emits must queue as
+    /// one atomic keyframe batch: the keyframe bit is read from the RTP
+    /// extension (identical on every fragment), never from the payload type.
+    #[test]
+    fn stap_a_first_keyframe_au_batches_atomically_as_keyframe() {
+        fn video_packet(seq: u16, marker: bool, payload: &[u8]) -> Bytes {
+            let mut packet = vec![0x90, ((marker as u8) << 7) | RTP_PAYLOAD_TYPE_H264];
+            packet.extend_from_slice(&seq.to_be_bytes());
+            packet.extend_from_slice(&0u32.to_be_bytes());
+            packet.extend_from_slice(&0x1122_3344u32.to_be_bytes());
+            packet.extend_from_slice(&[0xde, 0xbe, 0x00, 0x03]);
+            packet.extend_from_slice(&[
+                0x30,
+                VIDEO_MEDIA_FRAME_INFO_IDR,
+                0x51,
+                0,
+                0,
+                0x61,
+                0,
+                0,
+                0x91,
+                0,
+                0,
+                0,
+            ]);
+            packet.extend_from_slice(payload);
+            Bytes::from(packet)
+        }
+
+        let stap = [0x78, 0, 2, 0x67, 0x42, 0, 2, 0x68, 0xce];
+        let packets = [
+            video_packet(0, false, &stap),
+            video_packet(1, false, &[0x7c, 0x85, 0x01]),
+            video_packet(2, true, &[0x7c, 0x45, 0x02]),
+        ];
+        let mut queue = VecDeque::new();
+        let mut pending = Vec::new();
+        let mut awaiting_keyframe = SendKeyframeGate::default();
+        for packet in &packets {
+            let dropped = queue_transmit(
+                &mut queue,
+                &mut pending,
+                &mut awaiting_keyframe,
+                packet.clone(),
+            );
+            assert_eq!(dropped.packets, 0);
+        }
+        assert!(pending.is_empty());
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].kind, SendBatchKind::Video);
+        assert!(queue[0].video_keyframe, "STAP-A-first AU is a keyframe");
+        assert_eq!(queue[0].packets.len(), 3);
+        let sent: Vec<u16> = std::iter::from_fn(|| pop_next_packet(&mut queue))
+            .map(|(packet, _)| parse_rtp_header(&packet).unwrap().sequence_number)
+            .collect();
+        assert_eq!(sent, vec![0, 1, 2]);
+    }
+
     #[test]
     fn epoch_transition_cancels_media_already_removed_from_the_send_queue() {
         struct DropProbe(Arc<AtomicBool>);
@@ -3523,6 +3850,23 @@ mod tests {
                 .iter()
                 .all(|batch| batch.kind != SendBatchKind::Video || batch.started)
         );
+    }
+
+    #[test]
+    fn video_batch_keyframe_classification_ignores_rotation() {
+        use crate::voip::rtp::{VideoRtpStream, encode_rtp_header};
+
+        let mut stream = VideoRtpStream::new(0x1122_3344, 4500).unwrap();
+        for rotation in 0..=3 {
+            for keyframe in [false, true] {
+                let info = rotation | if keyframe { 0x08 } else { 0 };
+                let header = stream.next_video_packet(true, info);
+                let packet = Bytes::from(encode_rtp_header(&header));
+                let batch = SendBatch::video(vec![packet.clone()]);
+                assert_eq!(batch.video_keyframe, keyframe, "frame info {info:#04x}");
+                assert_eq!(batch.packets.front(), Some(&packet));
+            }
+        }
     }
 
     #[test]

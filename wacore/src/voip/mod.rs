@@ -58,12 +58,12 @@ pub use demux::{
 };
 pub use driver::{
     CallChannels, GroupControl, GroupRawEpoch, VideoControl, VideoControlReceiver,
-    VideoControlSender, run_call, video_control_channel,
+    VideoControlSender, VideoInput, run_call, video_control_channel,
 };
 pub use engine::{
     CallConfig, CallEngine, CallEvent, CodecDecisionSource, CodecSwitchError, DirectPeer,
-    EngineError, GroupControlKind, GroupEngineConfig, Input, Millis, NEVER, Output, SetupError,
-    TxIdSource,
+    EngineError, GroupControlKind, GroupEngineConfig, Input, KeyframeUrgency, Millis, NEVER,
+    Output, SetupError, TxIdSource,
 };
 pub use group::{GroupCallState, GroupStateApply};
 pub use group_audio::{
@@ -210,6 +210,7 @@ mod fuzz_tests {
                 let _ = rtp::is_rtp_version2(&b);
                 let _ = rtp::rtp_header_byte_length(&b);
                 let _ = rtp::parse_rtp_header(&b);
+                let _ = rtp::parse_whatsapp_media_frame_info(&b);
                 // RTCP
                 let _ = rtcp::is_rtcp_packet(&b);
                 let _ = rtcp::rtcp_payload_type(&b);

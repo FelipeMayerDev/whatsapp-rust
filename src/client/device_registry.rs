@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use log::{debug, info, warn};
+use std::collections::HashMap;
 use std::sync::Arc;
 use wacore_binary::{Jid, JidExt as _, Server};
 
@@ -193,7 +194,7 @@ impl Client {
                 return Ok(Arc::clone(&memo.devices));
             } else if self
                 .device_topology
-                .unchanged_for(memo.generation, |user| memo.members.contains(user))
+                .unchanged_for(memo.generation, &memo.members)
             {
                 // Stale stamp, but every change since it touched only users
                 // outside this group: re-stamp instead of recomputing, so
@@ -314,7 +315,9 @@ impl Client {
             crate::cache::Freshness::CachePreferred => {
                 self.get_user_devices_owned(jids_to_resolve).await?
             }
-            crate::cache::Freshness::Refresh => self.refresh_user_devices(jids_to_resolve).await?,
+            crate::cache::Freshness::Refresh => {
+                self.refresh_group_user_devices(jids_to_resolve).await?
+            }
         };
         if is_lid_mode {
             // WA Web expects LID addressing in SKDM <to> nodes for LID groups.
@@ -393,7 +396,7 @@ impl Client {
             // (log overflow, member touched) falls through to the recompute.
             if self
                 .device_topology
-                .unchanged_for(memo.generation, |user| memo.members.contains(user))
+                .unchanged_for(memo.generation, &memo.members)
             {
                 self.dm_devices_memo
                     .insert(
@@ -665,11 +668,27 @@ impl Client {
 
     /// WA Web: `isFromKnownDevice(author)` — local check only, no network.
     pub(crate) async fn is_from_known_device(&self, sender: &Jid) -> bool {
-        self.has_device(&sender.user, sender.device).await
+        self.has_device_for_jid(sender, sender.device).await
+    }
+
+    /// `has_device` for a caller holding the full `Jid`: the namespace picks
+    /// the single `lid_pn_cache` probe (see `resolve_lookup_keys_for_jid`).
+    /// Runs on every successful group decrypt and every retry receipt.
+    pub(crate) async fn has_device_for_jid(&self, jid: &Jid, device_id: u16) -> bool {
+        if device_id == 0 {
+            return true;
+        }
+        let lookup = self.resolve_lookup_keys_for_jid(jid).await;
+        self.has_device_in(&lookup, device_id).await
     }
 
     /// Check if a device exists for a user.
     /// Returns true for device_id 0 (primary device always exists).
+    ///
+    /// Every production caller holds a `Jid` and goes through
+    /// `has_device_for_jid`; this bare-user form remains for the tests that
+    /// probe a user under both of its namespaces.
+    #[cfg(test)]
     pub(crate) async fn has_device(&self, user: &str, device_id: u16) -> bool {
         if device_id == 0 {
             return true;
@@ -677,7 +696,10 @@ impl Client {
 
         // Borrowed keys avoid allocating the owned lookup variants on this hot path.
         let lookup = self.resolve_lookup_keys(user).await;
+        self.has_device_in(&lookup, device_id).await
+    }
 
+    async fn has_device_in(&self, lookup: &UserLookupKeys, device_id: u16) -> bool {
         for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
                 return record.devices.iter().any(|d| d.device_id() == device_id);
@@ -809,11 +831,24 @@ impl Client {
     ) -> Result<()> {
         use anyhow::Context;
 
+        // Test-only fault hook (see `Client::fail_next_device_list_write`):
+        // fail before touching cache or backend so the caller observes a
+        // write that never happened.
+        #[cfg(test)]
+        if self
+            .fail_next_device_list_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected device-list write failure");
+        }
+
         if records.is_empty() {
             return Ok(());
         }
 
         let mut prepared = Vec::with_capacity(records.len());
+        let mut cache_rows = Vec::with_capacity(records.len());
+        let mut lookups = Vec::with_capacity(records.len());
         let mut to_delete: Vec<Arc<str>> = Vec::new();
 
         for mut record in records {
@@ -822,22 +857,26 @@ impl Client {
             let canonical_key: Arc<str> = Arc::from(lookup.canonical_key());
             record.user = Arc::clone(&canonical_key);
 
-            let record_for_cache = record.clone();
-            // Same alias rule as update_device_list: record every lookup key.
-            self.device_registry_cache
-                .insert(
-                    guard,
-                    Arc::clone(&canonical_key),
-                    Arc::new(record_for_cache),
-                    lookup.all_keys().chain(std::iter::once(&*original_user)),
-                )
-                .await;
-
+            cache_rows.push((Arc::clone(&canonical_key), Arc::new(record.clone())));
             if *canonical_key != *original_user {
-                to_delete.push(original_user);
+                to_delete.push(Arc::clone(&original_user));
             }
+            lookups.push((lookup, original_user));
             prepared.push(record);
         }
+
+        // Same alias rule as update_device_list: every lookup key is recorded,
+        // the whole batch as one topology change. Collected first: the
+        // borrowed key iterator must not be held across the insert awaits.
+        let touched: Vec<&str> = lookups
+            .iter()
+            .flat_map(|(lookup, original_user)| {
+                lookup.all_keys().chain(std::iter::once(&**original_user))
+            })
+            .collect();
+        self.device_registry_cache
+            .insert_batch(guard, cache_rows, touched.iter().copied())
+            .await;
 
         let backend = self.persistence_manager.backend();
         backend
@@ -975,6 +1014,21 @@ impl Client {
 
         if let Some(bytes) = signed_bytes {
             if let Some(decoded) = wacore::adv::decode_key_index_list(bytes) {
+                // Clear tracking before pruning, including an ID re-added by
+                // this same notification with a different key index.
+                let identity_changed = record.raw_id.is_some_and(|raw_id| raw_id != decoded.raw_id);
+                for previous in &record.devices {
+                    if previous.device_id() != 0
+                        && (identity_changed
+                            || !wacore::adv::is_key_index_valid(previous.key_index(), &decoded))
+                        && let Err(error) = self
+                            .delete_sender_key_rows_for_device(user, previous.device_id())
+                            .await
+                    {
+                        warn!("patch_device_add: sender-key cleanup failed for {user}: {error}");
+                        return;
+                    }
+                }
                 // Check raw_id mismatch (identity change)
                 // TODO: WA Web also triggers clearRecord on advAccountType change
                 // (HOSTED ↔ E2EE), gated behind bizCoexGatingUtils.bizHostedDevicesEnabled().
@@ -1031,10 +1085,6 @@ impl Client {
                 devices.push(wacore::store::traits::DeviceInfo::new(0, None))
             });
         }
-
-        // New devices are picked up automatically by `resolve_skdm_targets`:
-        // unknown device → `device_has_key()` returns `None` → falls into
-        // `needs_skdm`. No global cache invalidation needed.
 
         if let Err(e) = self.update_device_list_guarded(record, &guard).await {
             warn!("patch_device_add: failed to persist: {e}");
@@ -1099,6 +1149,7 @@ impl Client {
         _server: &str,
         record: &wacore::store::traits::DeviceListRecord,
     ) {
+        let _identity_change = self.signal_cache.identity_continuity.changing([user]);
         let non_primary_ids: Vec<u16> = record
             .devices
             .iter()
@@ -1182,7 +1233,7 @@ impl Client {
     /// error is propagated so the caller can leave both DB and cache in their
     /// pre-call state rather than half-applying the cleanup.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.delete_sender_key_rows", level = "debug", skip_all, fields(device_id = device_id), err(Debug)))]
-    async fn delete_sender_key_rows_for_device(
+    pub(crate) async fn delete_sender_key_rows_for_device(
         &self,
         user: &str,
         device_id: u16,
@@ -1255,7 +1306,24 @@ impl Client {
         user: &str,
     ) -> Option<wacore::store::traits::DeviceListRecord> {
         let lookup = self.resolve_lookup_keys(user).await;
+        self.load_device_record_in(&lookup).await
+    }
 
+    /// `load_device_record` for a caller holding the full `Jid`, so the known
+    /// namespace costs one `lid_pn_cache` probe instead of two per user of a
+    /// device-list response.
+    pub(crate) async fn load_device_record_for_jid(
+        &self,
+        jid: &Jid,
+    ) -> Option<wacore::store::traits::DeviceListRecord> {
+        let lookup = self.resolve_lookup_keys_for_jid(jid).await;
+        self.load_device_record_in(&lookup).await
+    }
+
+    async fn load_device_record_in(
+        &self,
+        lookup: &UserLookupKeys,
+    ) -> Option<wacore::store::traits::DeviceListRecord> {
         for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
                 // Cold load-modify-persist path: callers mutate the owned record.
@@ -1280,6 +1348,141 @@ impl Client {
         }
 
         None
+    }
+
+    /// Backend rows for `keys`, each promoted into the registry cache and
+    /// keyed by the user its row is stored under. One backend call for the
+    /// whole set: the per-key form is a serialized write-queue round trip
+    /// each, which for a cold 256-member group was ~22 ms of SQLite before a
+    /// single device was resolved. An empty row is never a valid device set
+    /// (WA Web always keeps device 0), so it is neither promoted nor
+    /// returned and callers read its absence as a miss.
+    async fn fetch_registry_rows(
+        &self,
+        keys: &[&str],
+    ) -> HashMap<Arc<str>, Arc<wacore::store::traits::DeviceListRecord>> {
+        if keys.is_empty() {
+            return HashMap::new();
+        }
+        let rows = match self
+            .persistence_manager
+            .backend()
+            .get_devices_batch(keys)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    "device registry: batched DB lookup failed for {} keys: {e}",
+                    keys.len()
+                );
+                return HashMap::new();
+            }
+        };
+        let mut out = HashMap::with_capacity(rows.len());
+        for record in rows {
+            if record.devices.is_empty() {
+                continue;
+            }
+            let record = Arc::new(record);
+            self.device_registry_cache
+                .promote(Arc::clone(&record.user), Arc::clone(&record))
+                .await;
+            out.insert(Arc::clone(&record.user), record);
+        }
+        out
+    }
+
+    /// Owned registry records for `users`, positionally, from the cache or
+    /// one batched backend read for every user the cache does not hold.
+    /// The batched sibling of [`load_device_record_for_jid`], for a usync
+    /// response that carries one record per member.
+    pub(crate) async fn load_device_records_batch(
+        &self,
+        users: &[&Jid],
+    ) -> Vec<Option<wacore::store::traits::DeviceListRecord>> {
+        let mut out: Vec<Option<wacore::store::traits::DeviceListRecord>> =
+            Vec::with_capacity(users.len());
+        let mut pending: Vec<(usize, UserLookupKeys)> = Vec::new();
+        for (index, jid) in users.iter().enumerate() {
+            let lookup = self.resolve_lookup_keys_for_jid(jid).await;
+            let mut cached = None;
+            for key in lookup.all_keys() {
+                if let Some(record) = self.device_registry_cache.get(key).await {
+                    // Cold load-modify-persist path: callers mutate the owned record.
+                    cached = Some((*record).clone());
+                    break;
+                }
+            }
+            if cached.is_none() {
+                pending.push((index, lookup));
+            }
+            out.push(cached);
+        }
+        if pending.is_empty() {
+            return out;
+        }
+        let keys: Vec<&str> = pending
+            .iter()
+            .flat_map(|(_, lookup)| lookup.all_keys())
+            .collect();
+        let rows = self.fetch_registry_rows(&keys).await;
+        for (index, lookup) in &pending {
+            if let Some(record) = lookup.all_keys().find_map(|key| rows.get(key)) {
+                out[*index] = Some((**record).clone());
+            }
+        }
+        out
+    }
+
+    /// Registry devices for many users at once: the cache is probed per
+    /// user, then ONE backend read covers every user it could not answer.
+    /// Returns the resolved device JIDs and the users still unresolved (no
+    /// usable record anywhere), in that order. Same invariants as
+    /// [`get_devices_from_registry`]: an empty record is a miss, and a
+    /// backend row is promoted into the cache.
+    pub(crate) async fn get_devices_from_registry_batch(
+        &self,
+        jids: Vec<Jid>,
+    ) -> (Vec<Jid>, Vec<Jid>) {
+        let mut devices = Vec::with_capacity(jids.len() * 2);
+        let mut pending: Vec<(Jid, UserLookupKeys)> = Vec::new();
+        'users: for jid in jids {
+            let lookup = self.resolve_lookup_keys_for_jid(&jid).await;
+            for key in lookup.all_keys() {
+                if let Some(record) = self.device_registry_cache.get(key).await {
+                    let found = Self::reconstruct_device_jids(&jid, &record);
+                    if !found.is_empty() {
+                        devices.extend(found);
+                        continue 'users;
+                    }
+                }
+            }
+            pending.push((jid, lookup));
+        }
+        if pending.is_empty() {
+            return (devices, Vec::new());
+        }
+        // Distinct users never share a lookup key, so the list needs no
+        // deduplication.
+        let keys: Vec<&str> = pending
+            .iter()
+            .flat_map(|(_, lookup)| lookup.all_keys())
+            .collect();
+        let rows = self.fetch_registry_rows(&keys).await;
+        let mut missing = Vec::new();
+        for (jid, lookup) in pending {
+            let found = lookup
+                .all_keys()
+                .find_map(|key| rows.get(key))
+                .map(|record| Self::reconstruct_device_jids(&jid, record))
+                .filter(|found| !found.is_empty());
+            match found {
+                Some(found) => devices.extend(found),
+                None => missing.push(jid),
+            }
+        }
+        (devices, missing)
     }
 
     /// Look up device JIDs from the device registry (cache + DB) for a single user.
@@ -1618,11 +1821,15 @@ mod tests {
         );
 
         // Log overflow past the memo's stamp: cannot prove cleanliness,
-        // must recompute.
+        // must recompute. One change wider than the whole log is the
+        // cheapest way to overflow it.
         setup_device_record(&client, user_a, &[0]).await;
-        for _ in 0..300 {
-            client.device_topology.record(["5511000000003"]);
-        }
+        let flood: Vec<String> = (0..=crate::client::device_topology::TOPOLOGY_LOG_CAPACITY)
+            .map(|i| format!("5511{i:09}"))
+            .collect();
+        client
+            .device_topology
+            .record(flood.iter().map(String::as_str));
         let after_overflow = client
             .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
@@ -3110,6 +3317,66 @@ mod tests {
         assert!(rows.iter().all(|(jid, _)| jid != &device_jid));
     }
 
+    #[tokio::test]
+    async fn device_add_key_index_pruning_makes_reused_id_cold() {
+        let client = create_test_client().await;
+        let user = "12025550126";
+        let group = "120363000000000126@g.us";
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: user.into(),
+                devices: [
+                    wacore::store::traits::DeviceInfo::new(0, None),
+                    wacore::store::traits::DeviceInfo::new(7, Some(3)),
+                ]
+                .into(),
+                timestamp: 1,
+                phash: None,
+                raw_id: Some(1),
+            })
+            .await
+            .unwrap();
+        let device = Jid::pn(user).with_device(7).to_string();
+        client
+            .persistence_manager
+            .set_sender_key_status(group, &[(device.as_str(), true)])
+            .await
+            .unwrap();
+        let info = wacore::stanza::devices::KeyIndexInfo {
+            timestamp: 100,
+            signed_bytes: Some(make_signed_key_index_bytes(1, 4, vec![4])),
+        };
+        client
+            .patch_device_add(
+                user,
+                &wacore::stanza::devices::DeviceElement {
+                    jid: Jid::pn(user).with_device(7),
+                    key_index: Some(4),
+                    lid: None,
+                },
+                Some(&info),
+            )
+            .await;
+        assert!(
+            client
+                .persistence_manager
+                .get_sender_key_devices(group)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let record = client.load_device_record(user).await.unwrap();
+        assert_eq!(
+            record
+                .devices
+                .iter()
+                .find(|device| device.device_id() == 7)
+                .unwrap()
+                .key_index(),
+            Some(4)
+        );
+    }
+
     // A remove targeting the primary (device 0) must be a no-op: WA Web never
     // drops device 0. Regression guard for the symmetric failure to the add path
     // — dropping the primary persists a record that suppresses usync forever.
@@ -4017,7 +4284,7 @@ mod tests {
         use wacore::types::message::AddressingMode;
 
         let mut participants = Vec::with_capacity(members);
-        let mut lid_to_pn = std::collections::HashMap::with_capacity(members);
+        let mut lid_to_pn = HashMap::with_capacity(members);
         for i in 0..members {
             let lid_user = wacore_binary::CompactString::from(format!("1000000{i:08}"));
             let pn_user = wacore_binary::CompactString::from(format!("5511{i:09}"));
@@ -4068,7 +4335,8 @@ mod tests {
     /// The memo is per group and lives as long as the group stays warm, so its
     /// cost has to be a bound rather than a comment. Measured per (member,
     /// device) pair because both halves scale with it: the membership index is
-    /// keyed by user and the device list by device.
+    /// keyed by user and the device list by device. Budget: rebaseline per
+    /// [layout asserts](../../agent_docs/layout_asserts.md).
     #[test]
     fn group_devices_memo_retained_bytes_stay_bounded() {
         use wacore::stats::HeapSize;

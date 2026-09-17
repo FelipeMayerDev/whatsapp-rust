@@ -371,7 +371,15 @@ pub const BOT_SERVER: &str = "bot";
 pub const STATUS_BROADCAST_USER: &str = "status";
 pub const PSA_USER: &str = "0";
 
-pub type MessageId = String;
+/// A message id, inline: WhatsApp ids are 20–32 hex/base64 characters, and
+/// every client-generated one is 22, so the common case pays no heap
+/// allocation per message, per receipt id and per dedup-cache key.
+///
+/// The inline budget is `size_of::<String>()`, 24 bytes on a 64-bit target.
+/// On a 32-bit target (wasm32, ESP32) it is 12, so a 22-character id still
+/// heap-allocates there: no worse than the `String` it replaced, and the
+/// `&str` surface is the same, but the allocation saving is 64-bit-only.
+pub type MessageId = CompactString;
 pub type MessageServerId = i32;
 #[derive(Debug)]
 pub enum JidError {
@@ -1101,6 +1109,24 @@ pub fn push_jid_to_compact(
     buf: &mut CompactString,
 ) {
     write_jid!(infallible buf, user, server, agent, device);
+}
+
+/// Render a borrowed JID into a `CompactString` sized to what it actually
+/// takes, so a group id or a LID that fits the 24 inline bytes never touches
+/// the heap. Reserving `user.len() + 20` up front, as the decoder used to,
+/// exceeded the inline budget for every user longer than four characters and
+/// heap-allocated unconditionally — once per JID token in a device-list or
+/// usync response.
+pub fn jid_ref_to_compact(j: &JidRef<'_>) -> CompactString {
+    let mut writer = JidStackWriter::new();
+    if write_jid_fallible(&mut writer, &j.user, j.server, j.agent, j.device).is_ok() {
+        return CompactString::from(writer.as_str());
+    }
+    // A user part too long for the stack buffer (never seen on the wire)
+    // still renders, just back through the heap.
+    let mut s = CompactString::with_capacity(j.user.len() + 20);
+    push_jid_to_compact(&j.user, j.server, j.agent, j.device, &mut s);
+    s
 }
 
 /// Stack writer sized for any realistic JID, so `Display` can emit a single
