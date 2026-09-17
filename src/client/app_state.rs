@@ -1,6 +1,7 @@
 //! App-state collection sync and mutation dispatch.
 
 use super::*;
+use crate::features::{AppStateError, AppStateResyncMode, AppStateResyncReport};
 use crate::request::DEFAULT_IQ_TIMEOUT;
 
 /// Concurrency cap for pre-downloading app-state external blobs (independent CDN
@@ -947,67 +948,13 @@ impl Client {
             .detach();
     }
 
-    /// Replays a collection from the very beginning: drops the stored version
-    /// (keeping sync keys and mutation MACs in the store) and re-runs the full
-    /// sync, so every mutation the server still holds is decoded and dispatched
-    /// again. The consumer's handlers see the replay with `from_full_sync: true`
-    /// and must be idempotent/order-guarded (ZapFast's mute/pin/lock handlers
-    /// are). Whatsmeow's "remove app state" resync is the same maneuver.
-    ///
-    /// The reservation is taken *before* the version reset and held through the
-    /// replay: resetting under a concurrent sync of the same collection would
-    /// let that sync's checkpoint restore an advanced version (or half of one)
-    /// before this replay reads it, silently turning the from-zero replay into
-    /// an incremental one.
-    pub async fn resync_app_state_collection(self: &Arc<Self>, name: WAPatchName) {
-        // Wait for any holder: an in-flight sync or patch send is not doing
-        // this request's work (it pages from the version we are about to drop),
-        // so skipping would discharge the caller's one shot at a replay.
-        let _guard = match self
-            .reserve_for_sync(name, ReservationWait::Always, self.sync_scope(None))
+    /// Replays one collection from the beginning.
+    pub async fn resync_app_state_collection(
+        &self,
+        name: WAPatchName,
+    ) -> Result<AppStateResyncReport, AppStateError> {
+        self.resync_app_state([name], AppStateResyncMode::Snapshot)
             .await
-        {
-            Ok(guard) => guard,
-            Err(ReservationSkip::EquivalentSyncInFlight) => {
-                // Unreachable with `Always` (it never skips behind a sync);
-                // kept exhaustive so a future wait mode reads correctly here.
-                warn!(
-                    target: "Client/AppState",
-                    "Could not reserve {name:?} for a from-zero replay; an equivalent sync holds it"
-                );
-                return;
-            }
-            Err(ReservationSkip::WaitTimedOut) => {
-                warn!(
-                    target: "Client/AppState",
-                    "Gave up waiting to reserve {name:?} for a from-zero replay"
-                );
-                return;
-            }
-        };
-        let backend = self.persistence_manager.backend();
-        if let Err(error) = backend
-            .set_version(name.as_str(), wacore::appstate::hash::HashState::default())
-            .await
-        {
-            warn!(
-                target: "Client/AppState",
-                "Could not reset stored version for {name:?}: {error}"
-            );
-            return;
-        }
-        // A deferred or failed replay is not retried here: the caller asked
-        // once, and rescheduling a plain `full_sync` task would replay from
-        // whatever version survived — not the from-zero replay it asked for.
-        // Callers that must have the replay retry `resync_app_state_collection`.
-        match self.process_app_state_sync_task(name, true).await {
-            Ok(SyncOutcome::Completed) => {}
-            Ok(SyncOutcome::Deferred) => warn!(
-                target: "Client/AppState",
-                "From-zero replay of {name:?} deferred mid-way; not retried"
-            ),
-            Err(error) => self.log_sync_error(&format!("from-zero replay of {name:?}"), &error),
-        }
     }
 
     /// Public entry point for processing [`MajorSyncTask`] from the sync channel.
@@ -3748,6 +3695,19 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn collection_replay_reports_unknown_collection() {
+        let client =
+            crate::test_utils::create_test_client_with_name("appstate_replay_unknown").await;
+
+        let error = client
+            .resync_app_state_collection(WAPatchName::Unknown)
+            .await
+            .expect_err("unknown collection must not be replayed");
+
+        assert!(matches!(error, AppStateError::InvalidRequest(_)));
+    }
 
     #[tokio::test]
     async fn key_arrival_finishes_before_a_slow_fanout() {
